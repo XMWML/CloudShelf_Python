@@ -1,6 +1,7 @@
 import base64
 import os
 import posixpath
+import shutil
 import subprocess
 import tempfile
 import urllib.parse
@@ -17,7 +18,7 @@ class RemoteClient:
         self.p = profile
         self.password = profile.get('password', '')
         self.protocol = profile.get('protocol', 'FTP')
-        self.scheme = {'FTP': 'ftp', 'SFTP': 'sftp', 'WebDAV': 'https' if profile.get('tls', True) else 'http'}[self.protocol]
+        self.scheme = {'FTP': 'ftps' if profile.get('tls', False) else 'ftp', 'SFTP': 'sftp', 'WebDAV': 'https' if profile.get('tls', True) else 'http'}[self.protocol]
         self.base = norm(profile.get('base_path', '/'))
 
     def url(self, path):
@@ -109,7 +110,7 @@ class RemoteClient:
         config.write('url = "' + self.url('/').replace('"', '\\"') + '"\n')
         config.write('user = "' + (self.profile.get('username', '') + ':' + self.password).replace('"', '\\"') + '"\n')
         config.close()
-        command = ['/usr/bin/curl', '--config', config.name, '--fail', '--silent', '--show-error'] + arguments
+        command = [shutil.which('curl') or 'curl', '--config', config.name, '--fail', '--silent', '--show-error'] + arguments
         if output:
             command += ['--output', output]
         try:
