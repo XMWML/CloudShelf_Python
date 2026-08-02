@@ -199,8 +199,8 @@ RemoteClient = CoreRemoteClient
 class App(TkBase):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}
-        self.load_profiles(); self.load_settings(); self.build_ui(); self.refresh_profiles(); self.after(60000,self.auto_sync)
+        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}; self.sync_scan_busy=False
+        self.load_profiles(); self.load_settings(); self.build_ui(); self.refresh_profiles(); self.after(5000,self.auto_sync)
     def load_profiles(self):
         self.profiles=ProfileStore(PROFILE_FILE).load()
     def save_profiles(self):
@@ -435,16 +435,20 @@ class App(TkBase):
             report=SyncEngine(self.session,rule,lambda s: self.after(0,lambda:self.add_transfer('同步',s))).run(); self.save_profiles(); return report
         self.worker(job,lambda report:(self.add_transfer('同步',f"完成：上传 {report['uploaded']}，下载 {report['downloaded']}，删除 {report['deleted_remote']+report['deleted_local']}"),reload()))
     def auto_sync(self):
-        if self.session:
-            for rule in self.session.p.get('sync_rules',[]):
-                if not rule.get('watch'):
-                    continue
-                fingerprint=self.local_fingerprint(rule.get('local',''))
-                previous=self.local_fingerprints.get(rule.get('id'))
-                self.local_fingerprints[rule.get('id')]=fingerprint
-                due=rule.get('last_sync',0)+rule.get('interval',15)*60<=time.time()
-                if (previous is not None and previous != fingerprint) or due: self.run_rule(rule)
-        self.after(60000,self.auto_sync)
+        if self.session and self.auto_sync_enabled and not self.sync_scan_busy:
+            rules=list(self.session.p.get('sync_rules',[])); self.sync_scan_busy=True
+            def scan():
+                due=[]
+                for rule in rules:
+                    if not rule.get('watch'): continue
+                    fingerprint=self.local_fingerprint(rule.get('local','')); previous=self.local_fingerprints.get(rule.get('id')); self.local_fingerprints[rule.get('id')]=fingerprint
+                    if (previous is not None and previous != fingerprint) or rule.get('last_sync',0)+rule.get('interval',15)*60<=time.time(): due.append(rule)
+                self.after(0,lambda:self.finish_auto_scan(due))
+            threading.Thread(target=scan,daemon=True).start()
+        self.after(5000,self.auto_sync)
+    def finish_auto_scan(self,rules):
+        self.sync_scan_busy=False
+        for rule in rules:self.run_rule(rule)
     @staticmethod
     def local_fingerprint(folder):
         if not folder or not os.path.isdir(folder): return None

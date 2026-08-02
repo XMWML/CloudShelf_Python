@@ -80,6 +80,7 @@ python3 -m pip install keyring
 ## 已知限制
 
 - 当前传输任务显示状态和文件级进度文字，但没有暂停/取消按钮。
+- 自动同步使用跨平台轮询指纹，不依赖系统专用文件监控 API。
 - FTP 操作依赖系统 `curl`，SFTP 操作依赖系统 OpenSSH 客户端。
 - 不提供 Finder、Windows Explorer 或 Linux 文件管理器中的系统级网络挂载。
 
