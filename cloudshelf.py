@@ -30,7 +30,9 @@ class RemoteClient:
     def auth(self): return (self.p.get('username',''), self.password)
     def list(self, path):
         if self.p['protocol'] == 'SFTP':
-            cmd = ['sftp', '-q', '-P', str(self.p['port']), f'{self.p.get("username","")}@{self.p["host"]}']
+            cmd = ['sftp', '-q', '-P', str(self.p['port']), '-o', 'StrictHostKeyChecking=' + ('yes' if self.p.get('host_key_policy')=='strict' else 'accept-new')]
+            if self.p.get('private_key'): cmd += ['-i', self.p['private_key']]
+            cmd += [f'{self.p.get("username","")}@{self.p["host"]}']
             out = subprocess.check_output(cmd, input=f'ls -la {join(self.base,path)}\n'.encode(), stderr=subprocess.STDOUT, timeout=30).decode(errors='replace')
             result=[]
             for line in out.splitlines():
@@ -118,7 +120,10 @@ class SyncEngine:
             for rel in set(previous['remote'])-set(remote):
                 p=os.path.join(root,rel)
                 if os.path.exists(p): shutil.rmtree(p) if os.path.isdir(p) else os.remove(p); report['deleted_local']+=1
-        if self.rule.get('upload',True):
+        upload=self.rule.get('upload',True); download=self.rule.get('download',False)
+        if self.rule.get('conflict')=='keep_remote': upload=False
+        if self.rule.get('conflict')=='keep_local': download=False
+        if upload:
             for rel,data in local.items():
                 if data['directory']: continue
                 if rel not in remote or remote[rel]['size']!=data['size']:
@@ -128,7 +133,7 @@ class SyncEngine:
                         try:self.client.mkdir(current)
                         except Exception:pass
                     self.client.upload(data['path'],join(remote_root,parent)); report['uploaded']+=1; self.progress('上传 '+rel)
-        if self.rule.get('download'):
+        if download:
             for rel,data in remote.items():
                 if data['directory']: continue
                 p=os.path.join(root,rel); os.makedirs(os.path.dirname(p),exist_ok=True)
@@ -139,7 +144,7 @@ class SyncEngine:
 class App(tk.Tk):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.items=[]; self.transfers=[]
+        self.profiles=[]; self.session=None; self.path='/'; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True
         self.load_profiles(); self.build_ui(); self.refresh_profiles(); self.after(60000,self.auto_sync)
     def load_profiles(self):
         try: self.profiles=json.load(open(PROFILE_FILE))
@@ -148,19 +153,22 @@ class App(tk.Tk):
         os.makedirs(APP_DIR,exist_ok=True); json.dump(self.profiles,open(PROFILE_FILE,'w'),ensure_ascii=False,indent=2)
     def build_ui(self):
         bar=ttk.Frame(self,padding=6); bar.pack(fill='x')
-        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('同步管理',self.sync_manager),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
+        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('同步管理',self.sync_manager),('自动同步：开/关',self.toggle_auto_sync),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
+        self.bind_all('<Control-c>',lambda _:self.copy_selection()); self.bind_all('<Control-x>',lambda _:self.cut_selection()); self.bind_all('<Control-v>',lambda _:self.paste_selection()); self.bind_all('<Control-i>',lambda _:self.properties()); self.bind_all('<Control-r>',lambda _:self.refresh())
         pan=ttk.PanedWindow(self,orient='horizontal'); pan.pack(fill='both',expand=True,padx=6,pady=4)
         left=ttk.Frame(pan,width=270); right=ttk.Frame(pan); pan.add(left,weight=1); pan.add(right,weight=4)
         ttk.Label(left,text='连接').pack(anchor='w'); self.conn=ttk.Treeview(left,columns=('protocol',),show='tree headings',selectmode='browse'); self.conn.heading('#0',text='连接'); self.conn.heading('protocol',text='协议'); self.conn.column('protocol',width=70); self.conn.pack(fill='both',expand=True); self.conn.bind('<<TreeviewSelect>>',self.select_profile)
         head=ttk.Frame(right); head.pack(fill='x'); self.status=tk.StringVar(value='未选择连接'); ttk.Label(head,textvariable=self.status).pack(side='left'); self.path_var=tk.StringVar(value='/'); ttk.Label(head,textvariable=self.path_var).pack(side='right')
         self.files=ttk.Treeview(right,columns=('size','type','modified'),show='tree headings',selectmode='extended'); self.files.heading('#0',text='名称'); self.files.heading('size',text='大小'); self.files.heading('type',text='类型'); self.files.heading('modified',text='修改时间'); self.files.column('#0',width=430); self.files.column('size',width=100); self.files.column('type',width=100); self.files.pack(fill='both',expand=True); self.files.bind('<Double-1>',self.open_item); self.files.bind('<Button-3>',self.context_menu)
-        ttk.Label(self,text='传输任务').pack(anchor='w',padx=8); self.transfer=ttk.Treeview(self,columns=('state',),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
+        ttk.Label(self,text='传输任务').pack(anchor='w',padx=8); self.transfer=ttk.Treeview(self,columns=('state','progress'),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.heading('progress',text='进度'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
     def refresh_profiles(self):
         self.conn.delete(*self.conn.get_children()); [self.conn.insert('', 'end', iid=str(p['id']), text=p['name'], values=(p['protocol'],)) for p in self.profiles]
     def select_profile(self,_=None):
         sel=self.conn.selection();
         if not sel:return
         self.session=RemoteClient(next(p for p in self.profiles if str(p['id'])==sel[0])); self.path='/'; self.status.set(f'{self.session.p["name"]}  |  {self.session.p["protocol"]}  |  已连接'); self.refresh()
+    def toggle_auto_sync(self):
+        self.auto_sync_enabled=not self.auto_sync_enabled; messagebox.showinfo('自动同步', '已启用' if self.auto_sync_enabled else '已停用', parent=self)
     def worker(self, fn, ok=None):
         def run():
             try: result=fn(); self.after(0,lambda: ok(result) if ok else None)
@@ -195,6 +203,17 @@ class App(tk.Tk):
     def delete(self):
         xs=self.selected();
         if xs and messagebox.askyesno('确认删除',f'确定删除 {len(xs)} 个项目？',parent=self): self.worker(lambda:[self.session.delete(x['path']) for x in xs],lambda _:self.refresh())
+    def copy_selection(self): self.clipboard=self.selected(); self.clipboard_mode='copy'
+    def cut_selection(self): self.clipboard=self.selected(); self.clipboard_mode='move'
+    def paste_selection(self):
+        for item in self.clipboard:
+            fn=self.session.copy if self.clipboard_mode=='copy' else self.session.move
+            self.worker(lambda item=item,fn=fn:fn(item,self.path),lambda _:self.refresh())
+        self.clipboard=[]
+    def properties(self):
+        xs=self.selected()
+        if len(xs)==1:
+            x=xs[0]; messagebox.showinfo('属性',f'名称：{x["name"]}\n类型：{"文件夹" if x["directory"] else "文件"}\n远端路径：{x["path"]}\n大小：{fmt_size(x.get("size"))}\n修改时间：{x.get("modified","-")}',parent=self)
     def upload(self):
         if not self.session:return
         paths=filedialog.askopenfilenames(parent=self,title='选择要上传的文件')
@@ -237,7 +256,7 @@ class App(tk.Tk):
     def context_menu(self,e):
         iid=self.files.identify_row(e.y)
         if iid and iid!='__up__': self.files.selection_set(iid)
-        m=tk.Menu(self,tearoff=0); m.add_command(label='打开',command=self.open_item); m.add_command(label='下载',command=self.download); m.add_command(label='复制到',command=self.copy); m.add_command(label='移动到',command=self.move); m.add_command(label='重命名',command=self.rename); m.add_command(label='删除',command=self.delete); m.post(e.x_root,e.y_root)
+        m=tk.Menu(self,tearoff=0); m.add_command(label='打开',command=self.open_item); m.add_command(label='下载',command=self.download); m.add_command(label='复制',command=self.copy_selection); m.add_command(label='剪切',command=self.cut_selection); m.add_command(label='粘贴',command=self.paste_selection); m.add_command(label='复制到',command=self.copy); m.add_command(label='移动到',command=self.move); m.add_command(label='重命名',command=self.rename); m.add_command(label='属性',command=self.properties); m.add_command(label='删除',command=self.delete); m.post(e.x_root,e.y_root)
     def add_profile(self): self.profile_dialog()
     def edit_profile(self):
         sel=self.conn.selection();
@@ -273,12 +292,13 @@ class App(tk.Tk):
         checks=[]
         for row,(label,key,default) in enumerate([('本地新增/修改上传','upload',True),('远端新增/修改下载','download',False),('本地删除同步到远端','delete_remote',False),('远端删除同步到本地','delete_local',False),('检测本地变化自动同步','watch',False)],2):
             v=tk.BooleanVar(value=(old or {}).get(key,default)); checks.append((key,v)); ttk.Checkbutton(w,text=label,variable=v).grid(row=row,column=1,sticky='w',padx=8,pady=3)
-        ttk.Label(w,text='同步间隔(分钟)').grid(row=7,column=0,padx=8,pady=6); interval=tk.IntVar(value=(old or {}).get('interval',15)); ttk.Spinbox(w,from_=1,to=1440,textvariable=interval,width=8).grid(row=7,column=1,sticky='w',padx=8)
+        ttk.Label(w,text='冲突策略').grid(row=7,column=0,padx=8,pady=6); conflict=tk.StringVar(value=(old or {}).get('conflict','keep_newest')); ttk.Combobox(w,textvariable=conflict,values=('keep_newest','keep_local','keep_remote'),state='readonly').grid(row=7,column=1,sticky='w',padx=8)
+        ttk.Label(w,text='同步间隔(分钟)').grid(row=8,column=0,padx=8,pady=6); interval=tk.IntVar(value=(old or {}).get('interval',15)); ttk.Spinbox(w,from_=1,to=1440,textvariable=interval,width=8).grid(row=8,column=1,sticky='w',padx=8)
         def save():
-            r=old or {'id':str(uuid.uuid4()),'enabled':True}; r.update({k:v.get() for k,v in vars.items()}); r.update({k:v.get() for k,v in checks}); r['interval']=max(1,interval.get());
+            r=old or {'id':str(uuid.uuid4()),'enabled':True}; r.update({k:v.get() for k,v in vars.items()}); r.update({k:v.get() for k,v in checks}); r['conflict']=conflict.get(); r['interval']=max(1,interval.get());
             if not old: rules.append(r)
             self.save_profiles(); w.destroy(); reload()
-        ttk.Button(w,text='保存',command=save).grid(row=8,column=1,sticky='e',padx=8,pady=10)
+        ttk.Button(w,text='保存',command=save).grid(row=9,column=1,sticky='e',padx=8,pady=10)
     def run_rule(self,rule,reload=lambda:None):
         if not rule.get('enabled',True): return
         def job():
