@@ -19,6 +19,17 @@ CloudShelf 的跨平台 Python + Tkinter 文件管理器版本。它保留了原
 - macOS/Linux/Windows 启动脚本
 - 仅使用 Python 标准库，不需要安装第三方 Python 包
 
+## 项目结构
+
+```text
+cloudshelf.py              Tkinter 界面和交互控制器
+cloudshelf_core/paths.py   远端路径与大小格式化
+cloudshelf_core/remote.py  FTP、SFTP、WebDAV 远端客户端
+cloudshelf_core/storage.py 配置加载、迁移和安全写入
+cloudshelf_core/sync.py    与协议无关的同步引擎
+tests/test_core.py         核心逻辑测试
+```
+
 ## 安装与运行
 
 需要 Python 3.10+，并且 Python 发行版包含 Tkinter。
@@ -30,6 +41,12 @@ python3 cloudshelf.py
 ```
 
 在 macOS/Linux 上也可以运行 `run.command`；Windows 上运行 `run.bat`。
+
+运行核心测试：
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ### 平台依赖
 

@@ -3,6 +3,10 @@ import json, os, posixpath, shutil, subprocess, tempfile, threading, uuid, urlli
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+from cloudshelf_core.paths import fmt_size as core_fmt_size, join as core_join, norm as core_norm
+from cloudshelf_core.storage import ProfileStore
+from cloudshelf_core.sync import SyncEngine as CoreSyncEngine
+from cloudshelf_core.remote import RemoteClient as CoreRemoteClient
 
 APP_DIR = os.path.join(os.path.expanduser('~'), '.cloudshelf')
 PROFILE_FILE = os.path.join(APP_DIR, 'connections.json')
@@ -18,7 +22,7 @@ def fmt_size(n):
         n /= 1024
     return f'{n:.1f} PB'
 
-class RemoteClient:
+class LegacyRemoteClient:
     def __init__(self, p):
         self.p = p
         self.password = p.get('password', '')
@@ -120,7 +124,7 @@ class RemoteClient:
             self.copy(item,directory); self.delete(item['path'])
         else: self.rename(item['path'],target)
 
-class SyncEngine:
+class LegacySyncEngine:
     def __init__(self, client, rule, progress=None):
         self.client,self.rule,self.progress=client,rule,progress or (lambda _:None)
     def local_inventory(self):
@@ -177,16 +181,22 @@ class SyncEngine:
                     self.client.download(data['item'],p); report['downloaded']+=1; self.progress('下载 '+rel)
         self.rule['snapshot']={'local':list(self.local_inventory()),'remote':list(self.remote_inventory(remote_root))}; self.rule['last_sync']=time.time(); return report
 
+norm = core_norm
+join = core_join
+fmt_size = core_fmt_size
+SyncEngine = CoreSyncEngine
+RemoteClient = CoreRemoteClient
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
         self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True
         self.load_profiles(); self.build_ui(); self.refresh_profiles(); self.after(60000,self.auto_sync)
     def load_profiles(self):
-        try: self.profiles=json.load(open(PROFILE_FILE))
-        except (OSError,ValueError): self.profiles=[]
+        self.profiles=ProfileStore(PROFILE_FILE).load()
     def save_profiles(self):
-        os.makedirs(APP_DIR,exist_ok=True); json.dump(self.profiles,open(PROFILE_FILE,'w'),ensure_ascii=False,indent=2)
+        ProfileStore(PROFILE_FILE).save(self.profiles)
     def build_ui(self):
         bar=ttk.Frame(self,padding=6); bar.pack(fill='x')
         for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('删除连接',self.delete_profile),('同步管理',self.sync_manager),('自动同步：开/关',self.toggle_auto_sync),('后退',self.go_back),('前进',self.go_forward),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
@@ -381,7 +391,7 @@ class App(tk.Tk):
         fields=[('名称','name'),('协议','protocol'),('服务器地址','host'),('端口','port'),('用户名','username'),('密码','password'),('远端根目录','base_path'),('认证方式','auth'),('私钥路径','private_key'),('主机密钥策略','host_key_policy')]
         for r,(label,key) in enumerate(fields):
             ttk.Label(w,text=label).grid(row=r,column=0,sticky='w',padx=10,pady=5)
-            v=tk.StringVar(value=str((old or {}).get(key, {'protocol':'FTP','port':'21','base_path':'/'}.get(key,''))))
+            v=tk.StringVar(value=str((old or {}).get(key, {'protocol':'FTP','port':'21','base_path':'/','auth':'password','host_key_policy':'accept-new','private_key':''}.get(key,''))))
             vars[key]=v
             if key == 'protocol': ent=ttk.Combobox(w,textvariable=v,values=('FTP','SFTP','WebDAV'),state='readonly')
             elif key == 'auth': ent=ttk.Combobox(w,textvariable=v,values=('password','ssh_agent','private_key'),state='readonly')
