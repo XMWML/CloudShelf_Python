@@ -18,8 +18,13 @@ class CredentialStore:
 
     @classmethod
     def save(cls, profile_id, password):
-        if keyring is not None and password:
+        if keyring is None or not password:
+            return False
+        try:
             keyring.set_password(cls.service, str(profile_id), password)
+            return True
+        except Exception:
+            return False
 
     @classmethod
     def load(cls, profile_id):
@@ -67,8 +72,7 @@ class ProfileStore:
         for profile in profiles:
             entry = dict(profile)
             password = entry.get('password', '')
-            if CredentialStore.available() and password:
-                CredentialStore.save(entry.get('id'), password)
+            if CredentialStore.save(entry.get('id'), password):
                 entry.pop('password', None)
             persisted.append(entry)
         with open(temporary, 'w', encoding='utf-8') as handle:

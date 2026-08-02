@@ -42,6 +42,19 @@ cd CloudShelf_Python
 python3 cloudshelf.py
 ```
 
+也可以安装为命令行应用：
+
+```bash
+python3 -m pip install .
+cloudshelf
+```
+
+安装可选的桌面适配层：
+
+```bash
+python3 -m pip install '.[desktop]'
+```
+
 在 macOS/Linux 上也可以运行 `run.command`；Windows 上运行 `run.bat`。
 
 运行核心测试：
@@ -69,13 +82,13 @@ python3 -m unittest discover -s tests -v
 
 ## 安全说明
 
-当前版本为了保持跨平台和零依赖，将密码保存在本地连接配置文件中。请确保该文件权限仅当前用户可读，并不要把个人配置文件提交到 Git。后续可以接入 Windows Credential Manager、macOS Keychain 和 Linux Secret Service。
-
-如果安装了可选的 `keyring` 包，连接密码会优先保存到当前系统的凭据存储，配置文件中不再保存密码：
+连接配置文件会以仅当前用户可读写的权限保存。安装可选的 `keyring` 包后，密码优先保存到当前系统的凭据存储，配置文件中不再保存密码：
 
 ```bash
 python3 -m pip install keyring
 ```
+
+未安装 `keyring` 时，为保持零依赖兼容性，密码会保存在本地连接配置中。请勿将该文件提交到版本控制或共享给他人。
 
 ## 已知限制
 

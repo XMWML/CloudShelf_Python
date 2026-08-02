@@ -55,6 +55,20 @@ class SyncEngine:
         visit(folder)
         return output
 
+    def ensure_remote_root(self, folder):
+        current = '/'
+        for part in filter(None, norm(folder).split('/')):
+            current = join(current, part)
+            try:
+                self.client.mkdir(current)
+            except Exception:
+                pass
+
+    @staticmethod
+    def deletion_roots(paths):
+        ordered = sorted(paths, key=lambda path: len(path.split('/')))
+        return [path for path in ordered if not any(path.startswith(parent + '/') for parent in ordered if parent != path)]
+
     @staticmethod
     def remote_mtime(item):
         try:
@@ -66,19 +80,20 @@ class SyncEngine:
         root = os.path.abspath(self.rule['local'])
         os.makedirs(root, exist_ok=True)
         remote_root = norm(self.rule['remote'])
+        self.ensure_remote_root(remote_root)
         local = self.local_inventory()
         remote = self.remote_inventory(remote_root)
         report = {'uploaded': 0, 'downloaded': 0, 'deleted_local': 0, 'deleted_remote': 0}
         snapshot = self.rule.get('snapshot') or {'local': [], 'remote': []}
 
         if self.rule.get('delete_remote'):
-            for relative in set(snapshot['local']) - set(local):
+            for relative in self.deletion_roots(set(snapshot['local']) - set(local)):
                 if relative in remote:
                     self.client.delete(remote[relative]['item']['path'])
                     report['deleted_remote'] += 1
 
         if self.rule.get('delete_local'):
-            for relative in set(snapshot['remote']) - set(remote):
+            for relative in self.deletion_roots(set(snapshot['remote']) - set(remote)):
                 path = os.path.join(root, relative)
                 if os.path.exists(path):
                     shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)

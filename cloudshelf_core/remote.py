@@ -142,7 +142,16 @@ class RemoteClient:
 
     def delete(self, path):
         if self.protocol == 'SFTP':
-            return self._sftp_command(['rm -r ' + self._quote(path)])
+            try:
+                children = self.list(path)
+            except Exception:
+                return self._sftp_command(['rm ' + self._quote(path)])
+            for child in children:
+                self.delete(child['path'])
+            try:
+                return self._sftp_command(['rmdir ' + self._quote(path)])
+            except subprocess.CalledProcessError:
+                return self._sftp_command(['rm ' + self._quote(path)])
         if self.protocol == 'FTP':
             try:
                 children = self.list(path)
@@ -198,8 +207,6 @@ class RemoteClient:
                 if progress: progress(sent,size)
         response=connection.getresponse(); body=response.read(); connection.close()
         if response.status >= 400: raise RuntimeError(f'WebDAV upload failed: HTTP {response.status} {body.decode(errors="replace")}')
-        with open(local, 'rb') as handle:
-            return self._request('PUT', target, handle.read())
 
     def copy(self, item, directory):
         target = join(directory, item['name'])
@@ -209,9 +216,25 @@ class RemoteClient:
                 for child in self.list(item['path']):
                     self.copy(child, target)
                 return
-            return self._sftp_command(['cp ' + self._quote(item['path']) + ' ' + self._quote(target)])
+            try:
+                return self._sftp_command(['cp ' + self._quote(item['path']) + ' ' + self._quote(target)])
+            except subprocess.CalledProcessError:
+                temporary = os.path.join(tempfile.gettempdir(), 'cloudshelf-' + str(uuid.uuid4()))
+                try:
+                    self.download(item, temporary)
+                    return self.upload(temporary, directory)
+                finally:
+                    try:
+                        os.remove(temporary)
+                    except OSError:
+                        pass
         if self.protocol == 'WebDAV':
             return self._request('COPY', item['path'], headers={'Destination': self.url(target), 'Overwrite': 'T'})
+        if item.get('directory'):
+            self.mkdir(target)
+            for child in self.list(item['path']):
+                self.copy(child, target)
+            return
         temporary = os.path.join(tempfile.gettempdir(), 'cloudshelf-' + str(uuid.uuid4()))
         try:
             self.download(item, temporary)

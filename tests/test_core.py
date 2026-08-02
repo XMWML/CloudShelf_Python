@@ -62,6 +62,26 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(ftps.p['base_path'], '/backups')
         self.assertTrue(ftps.url('/').startswith('ftps://files.example.com:990/'))
 
+    def test_ftp_folder_copy_is_recursive(self):
+        client = RemoteClient({'host': 'example.com', 'port': 21, 'protocol': 'FTP'})
+        items = {
+            '/source': [{'name': 'nested', 'path': '/source/nested', 'directory': True, 'size': None}],
+            '/source/nested': [{'name': 'file.txt', 'path': '/source/nested/file.txt', 'directory': False, 'size': 1}],
+        }
+        created, uploaded = [], []
+        def download(item, target):
+            with open(target, 'wb') as handle:
+                handle.write(b'x')
+        client.list = lambda path: items.get(path, [])
+        client.mkdir = lambda path: created.append(path)
+        client.download = download
+        client.upload = lambda local, directory: uploaded.append((os.path.basename(local), directory))
+        client.copy({'name': 'source', 'path': '/source', 'directory': True}, '/target')
+        self.assertEqual(created, ['/target/source', '/target/source/nested'])
+        self.assertEqual(len(uploaded), 1)
+        self.assertTrue(uploaded[0][0].startswith('cloudshelf-'))
+        self.assertEqual(uploaded[0][1], '/target/source/nested')
+
     def test_profile_migration_and_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, 'connections.json')
@@ -90,6 +110,24 @@ class CoreTests(unittest.TestCase):
             rule = {'local': local, 'remote': '/sync', 'upload': False, 'delete_remote': True, 'snapshot': {'local': ['old.txt'], 'remote': ['old.txt']}}
             SyncEngine(client, rule).run()
             self.assertEqual(client.deletes, ['/sync/old.txt'])
+
+    def test_sync_creates_missing_remote_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            local = os.path.join(directory, 'local'); os.makedirs(local)
+            client = FakeClient()
+            SyncEngine(client, {'local': local, 'remote': '/sync/nested', 'upload': False}).run()
+            self.assertIn('/sync', client.items)
+            self.assertIn('/sync/nested', client.items)
+
+    def test_deletion_uses_parent_root_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            local = os.path.join(directory, 'local'); os.makedirs(local)
+            client = FakeClient()
+            client.items['/sync/removed'] = {'directory': True}
+            client.items['/sync/removed/file.txt'] = {'directory': False, 'size': 1}
+            rule = {'local': local, 'remote': '/sync', 'upload': False, 'delete_remote': True, 'snapshot': {'local': ['removed', 'removed/file.txt'], 'remote': []}}
+            SyncEngine(client, rule).run()
+            self.assertEqual(client.deletes, ['/sync/removed'])
 
     def test_duplicate_conflict_creates_second_copy(self):
         with tempfile.TemporaryDirectory() as directory:

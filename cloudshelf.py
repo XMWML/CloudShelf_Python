@@ -4,7 +4,7 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from cloudshelf_core.paths import fmt_size as core_fmt_size, join as core_join, norm as core_norm
-from cloudshelf_core.storage import ProfileStore
+from cloudshelf_core.storage import CredentialStore, ProfileStore
 from cloudshelf_core.sync import SyncEngine as CoreSyncEngine
 from cloudshelf_core.remote import RemoteClient as CoreRemoteClient
 
@@ -216,7 +216,7 @@ RemoteClient = CoreRemoteClient
 class App(TkBase):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.progress_stats={}; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.max_workers=3; self.local_fingerprints={}; self.sync_scan_busy=False; self.load_profiles(); self.load_settings(); os.makedirs(APP_DIR,exist_ok=True); logging.basicConfig(filename=LOG_FILE,level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s'); self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
+        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.progress_stats={}; self.active_sync_rules=set(); self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.max_workers=3; self.local_fingerprints={}; self.sync_scan_busy=False; self.load_profiles(); self.load_settings(); os.makedirs(APP_DIR,exist_ok=True); logging.basicConfig(filename=LOG_FILE,level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s'); self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
         self.protocol('WM_DELETE_WINDOW',self.close_app); self.build_ui(); self.refresh_profiles(); self.after(5000,self.auto_sync)
     def load_profiles(self):
         self.profiles=ProfileStore(PROFILE_FILE).load()
@@ -423,7 +423,7 @@ class App(TkBase):
         if not sel:return
         p=next(p for p in self.profiles if str(p['id'])==sel[0])
         if messagebox.askyesno('删除连接',f'确定删除连接“{p["name"]}”？',parent=self):
-            self.profiles.remove(p); self.session=None; self.save_profiles(); self.refresh_profiles(); self.files.delete(*self.files.get_children()); self.status.set('未选择连接')
+            CredentialStore.delete(p['id']); self.profiles.remove(p); self.session=None; self.save_profiles(); self.refresh_profiles(); self.files.delete(*self.files.get_children()); self.status.set('未选择连接')
     def edit_profile(self):
         sel=self.conn.selection();
         if sel:self.profile_dialog(next(p for p in self.profiles if str(p['id'])==sel[0]))
@@ -487,9 +487,14 @@ class App(TkBase):
         tree.bind('<Double-1>',lambda _: load(tree.selection()[0],tree.item(tree.selection()[0],'values')[0]) if tree.selection() else None)
         ttk.Button(w,text='选择',command=choose).pack(anchor='e',padx=8,pady=8)
     def run_rule(self,rule,reload=lambda:None):
-        if not rule.get('enabled',True): return
+        rule_id=rule.get('id')
+        if not rule.get('enabled',True) or rule_id in self.active_sync_rules: return
+        self.active_sync_rules.add(rule_id)
         def job():
-            report=SyncEngine(self.session,rule,lambda s: self.after(0,lambda:self.add_transfer('同步',s))).run(); self.save_profiles(); return report
+            try:
+                report=SyncEngine(self.session,rule,lambda s: self.after(0,lambda:self.add_transfer('同步',s))).run(); self.save_profiles(); return report
+            finally:
+                self.after(0,lambda:self.active_sync_rules.discard(rule_id))
         self.worker(job,lambda report:(self.add_transfer('同步',f"完成：上传 {report['uploaded']}，下载 {report['downloaded']}，删除 {report['deleted_remote']+report['deleted_local']}"),reload()))
     def auto_sync(self):
         if self.session and self.auto_sync_enabled and not self.sync_scan_busy:
@@ -497,9 +502,11 @@ class App(TkBase):
             def scan():
                 due=[]
                 for rule in rules:
-                    if not rule.get('watch'): continue
-                    fingerprint=self.local_fingerprint(rule.get('local','')); previous=self.local_fingerprints.get(rule.get('id')); self.local_fingerprints[rule.get('id')]=fingerprint
-                    if (previous is not None and previous != fingerprint) or rule.get('last_sync',0)+rule.get('interval',15)*60<=time.time(): due.append(rule)
+                    changed=False
+                    if rule.get('watch'):
+                        fingerprint=self.local_fingerprint(rule.get('local','')); previous=self.local_fingerprints.get(rule.get('id')); self.local_fingerprints[rule.get('id')]=fingerprint; changed=previous is not None and previous != fingerprint
+                    scheduled=rule.get('last_sync',0)+rule.get('interval',15)*60<=time.time()
+                    if changed or scheduled: due.append(rule)
                 self.after(0,lambda:self.finish_auto_scan(due))
             threading.Thread(target=scan,daemon=True).start()
         self.after(5000,self.auto_sync)
@@ -555,4 +562,9 @@ class App(TkBase):
         path=filedialog.askopenfilename(parent=self,title='选择 SSH 私钥文件')
         if path: variable.set(path)
 
-if __name__=='__main__': App().mainloop()
+def main():
+    App().mainloop()
+
+
+if __name__ == '__main__':
+    main()
