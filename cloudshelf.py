@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, posixpath, shutil, subprocess, tempfile, threading, uuid, urllib.parse, urllib.request, urllib.error, time
+import json, os, posixpath, shutil, subprocess, tempfile, threading, uuid, urllib.parse, urllib.request, urllib.error, time, email.utils
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -129,7 +129,7 @@ class SyncEngine:
             rel=os.path.relpath(base,root)
             if rel!='.': out[rel]={'directory':True}
             for name in files:
-                p=os.path.join(base,name); out[os.path.relpath(p,root)]={'directory':False,'size':os.path.getsize(p),'path':p}
+                p=os.path.join(base,name); out[os.path.relpath(p,root)]={'directory':False,'size':os.path.getsize(p),'mtime':os.path.getmtime(p),'path':p}
         return out
     def remote_inventory(self, folder):
         out={}
@@ -155,7 +155,11 @@ class SyncEngine:
         if upload:
             for rel,data in local.items():
                 if data['directory']: continue
-                if rel not in remote or remote[rel]['size']!=data['size']:
+                remote_item=remote.get(rel); remote_time=0
+                if remote_item:
+                    try: remote_time=email.utils.parsedate_to_datetime(remote_item['item'].get('modified','')).timestamp()
+                    except (TypeError,ValueError,OverflowError): remote_time=0
+                if rel not in remote or remote_item['size']!=data['size'] or (self.rule.get('conflict')=='keep_newest' and data.get('mtime',0)>remote_time):
                     parent=posixpath.dirname(rel); current=remote_root
                     for part in [x for x in parent.split('/') if x]:
                         current=join(current,part)
@@ -165,15 +169,18 @@ class SyncEngine:
         if download:
             for rel,data in remote.items():
                 if data['directory']: continue
-                p=os.path.join(root,rel); os.makedirs(os.path.dirname(p),exist_ok=True)
-                if not os.path.exists(p) or os.path.getsize(p)!=data['size']:
+                p=os.path.join(root,rel); os.makedirs(os.path.dirname(p),exist_ok=True); local_time=os.path.getmtime(p) if os.path.exists(p) else 0; remote_time=0
+                try: remote_time=email.utils.parsedate_to_datetime(data['item'].get('modified','')).timestamp()
+                except (TypeError,ValueError,OverflowError): pass
+                newer_remote=self.rule.get('conflict')=='keep_newest' and remote_time>local_time
+                if not os.path.exists(p) or os.path.getsize(p)!=data['size'] or newer_remote:
                     self.client.download(data['item'],p); report['downloaded']+=1; self.progress('下载 '+rel)
         self.rule['snapshot']={'local':list(self.local_inventory()),'remote':list(self.remote_inventory(remote_root))}; self.rule['last_sync']=time.time(); return report
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True
+        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True
         self.load_profiles(); self.build_ui(); self.refresh_profiles(); self.after(60000,self.auto_sync)
     def load_profiles(self):
         try: self.profiles=json.load(open(PROFILE_FILE))
@@ -182,11 +189,11 @@ class App(tk.Tk):
         os.makedirs(APP_DIR,exist_ok=True); json.dump(self.profiles,open(PROFILE_FILE,'w'),ensure_ascii=False,indent=2)
     def build_ui(self):
         bar=ttk.Frame(self,padding=6); bar.pack(fill='x')
-        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('同步管理',self.sync_manager),('自动同步：开/关',self.toggle_auto_sync),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
+        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('删除连接',self.delete_profile),('同步管理',self.sync_manager),('自动同步：开/关',self.toggle_auto_sync),('后退',self.go_back),('前进',self.go_forward),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
         self.bind_all('<Control-c>',lambda _:self.copy_selection()); self.bind_all('<Control-x>',lambda _:self.cut_selection()); self.bind_all('<Control-v>',lambda _:self.paste_selection()); self.bind_all('<Control-i>',lambda _:self.properties()); self.bind_all('<Control-r>',lambda _:self.refresh())
         pan=ttk.PanedWindow(self,orient='horizontal'); pan.pack(fill='both',expand=True,padx=6,pady=4)
         left=ttk.Frame(pan,width=270); right=ttk.Frame(pan); pan.add(left,weight=1); pan.add(right,weight=4)
-        ttk.Label(left,text='连接').pack(anchor='w'); self.conn=ttk.Treeview(left,columns=('protocol',),show='tree headings',selectmode='browse'); self.conn.heading('#0',text='连接'); self.conn.heading('protocol',text='协议'); self.conn.column('protocol',width=70); self.conn.pack(fill='both',expand=True); self.conn.bind('<<TreeviewSelect>>',self.select_profile)
+        ttk.Label(left,text='连接').pack(anchor='w'); self.conn=ttk.Treeview(left,columns=('protocol',),show='tree headings',selectmode='browse'); self.conn.heading('#0',text='连接'); self.conn.heading('protocol',text='协议'); self.conn.column('protocol',width=70); self.conn.pack(fill='both',expand=True); self.conn.bind('<<TreeviewSelect>>',self.select_profile); self.conn.bind('<Button-3>',self.connection_menu)
         head=ttk.Frame(right); head.pack(fill='x'); self.status=tk.StringVar(value='未选择连接'); ttk.Label(head,textvariable=self.status).pack(side='left'); self.path_var=tk.StringVar(value='/'); ttk.Label(head,textvariable=self.path_var).pack(side='right')
         self.files=ttk.Treeview(right,columns=('size','type','modified'),show='tree headings',selectmode='extended'); self.files.heading('#0',text='名称'); self.files.heading('size',text='大小'); self.files.heading('type',text='类型'); self.files.heading('modified',text='修改时间'); self.files.column('#0',width=430); self.files.column('size',width=100); self.files.column('type',width=100); self.files.pack(fill='both',expand=True); self.files.bind('<Double-1>',self.open_item); self.files.bind('<Button-3>',self.context_menu)
         ttk.Label(self,text='传输任务').pack(anchor='w',padx=8); self.transfer=ttk.Treeview(self,columns=('state','progress'),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.heading('progress',text='进度'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
@@ -195,9 +202,13 @@ class App(tk.Tk):
     def select_profile(self,_=None):
         sel=self.conn.selection();
         if not sel:return
-        self.session=RemoteClient(next(p for p in self.profiles if str(p['id'])==sel[0])); self.path='/'; self.status.set(f'{self.session.p["name"]}  |  {self.session.p["protocol"]}  |  已连接'); self.refresh()
+        self.session=RemoteClient(next(p for p in self.profiles if str(p['id'])==sel[0])); self.path='/'; self.history=['/']; self.history_index=0; self.status.set(f'{self.session.p["name"]}  |  {self.session.p["protocol"]}  |  已连接'); self.refresh()
     def toggle_auto_sync(self):
         self.auto_sync_enabled=not self.auto_sync_enabled; messagebox.showinfo('自动同步', '已启用' if self.auto_sync_enabled else '已停用', parent=self)
+    def connection_menu(self,event):
+        iid=self.conn.identify_row(event.y)
+        if iid:self.conn.selection_set(iid)
+        menu=tk.Menu(self,tearoff=0); menu.add_command(label='连接',command=self.select_profile); menu.add_command(label='编辑',command=self.edit_profile); menu.add_command(label='删除',command=self.delete_profile); menu.post(event.x_root,event.y_root)
     def worker(self, fn, ok=None):
         def run():
             try: result=fn(); self.after(0,lambda: ok(result) if ok else None)
@@ -216,9 +227,16 @@ class App(tk.Tk):
         if not sel:return
         if sel[0]=='__up__': self.go_up(); return
         x=self.items[int(sel[0])]
-        if x['directory']: self.path=x['path']; self.refresh()
+        if x['directory']: self.open_path(x['path'])
+    def open_path(self,path):
+        if self.history_index < len(self.history)-1:self.history=self.history[:self.history_index+1]
+        self.history.append(norm(path)); self.history_index+=1; self.path=norm(path); self.refresh()
+    def go_back(self):
+        if self.history_index>0:self.history_index-=1; self.path=self.history[self.history_index]; self.refresh()
+    def go_forward(self):
+        if self.history_index+1<len(self.history):self.history_index+=1; self.path=self.history[self.history_index]; self.refresh()
     def go_up(self):
-        if self.session and self.path!='/': self.path=posixpath.dirname(self.path) or '/'; self.refresh()
+        if self.session and self.path!='/': self.open_path(posixpath.dirname(self.path) or '/')
     def selected(self): return [self.items[int(i)] for i in self.files.selection() if i!='__up__']
     def mkdir(self):
         if not self.session:return
@@ -301,6 +319,12 @@ class App(tk.Tk):
         if iid and iid!='__up__': self.files.selection_set(iid)
         m=tk.Menu(self,tearoff=0); m.add_command(label='打开',command=self.open_item); m.add_command(label='下载',command=self.download); m.add_command(label='复制',command=self.copy_selection); m.add_command(label='剪切',command=self.cut_selection); m.add_command(label='粘贴',command=self.paste_selection); m.add_command(label='复制到',command=self.copy); m.add_command(label='移动到',command=self.move); m.add_command(label='重命名',command=self.rename); m.add_command(label='属性',command=self.properties); m.add_command(label='删除',command=self.delete); m.post(e.x_root,e.y_root)
     def add_profile(self): self.profile_dialog()
+    def delete_profile(self):
+        sel=self.conn.selection()
+        if not sel:return
+        p=next(p for p in self.profiles if str(p['id'])==sel[0])
+        if messagebox.askyesno('删除连接',f'确定删除连接“{p["name"]}”？',parent=self):
+            self.profiles.remove(p); self.session=None; self.save_profiles(); self.refresh_profiles(); self.files.delete(*self.files.get_children()); self.status.set('未选择连接')
     def edit_profile(self):
         sel=self.conn.selection();
         if sel:self.profile_dialog(next(p for p in self.profiles if str(p['id'])==sel[0]))
