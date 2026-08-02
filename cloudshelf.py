@@ -10,6 +10,7 @@ from cloudshelf_core.remote import RemoteClient as CoreRemoteClient
 
 APP_DIR = os.path.join(os.path.expanduser('~'), '.cloudshelf')
 PROFILE_FILE = os.path.join(APP_DIR, 'connections.json')
+SETTINGS_FILE = os.path.join(APP_DIR, 'settings.json')
 
 def norm(p):
     p = '/' + (p or '').strip().strip('/')
@@ -192,11 +193,18 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
         self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}
-        self.load_profiles(); self.build_ui(); self.refresh_profiles(); self.after(60000,self.auto_sync)
+        self.load_profiles(); self.load_settings(); self.build_ui(); self.refresh_profiles(); self.after(60000,self.auto_sync)
     def load_profiles(self):
         self.profiles=ProfileStore(PROFILE_FILE).load()
     def save_profiles(self):
         ProfileStore(PROFILE_FILE).save(self.profiles)
+    def load_settings(self):
+        try:
+            with open(SETTINGS_FILE, encoding='utf-8') as handle: self.auto_sync_enabled=bool(json.load(handle).get('automatic_sync',True))
+        except (OSError,ValueError,TypeError): self.auto_sync_enabled=True
+    def save_settings(self):
+        os.makedirs(APP_DIR,exist_ok=True)
+        with open(SETTINGS_FILE,'w',encoding='utf-8') as handle: json.dump({'automatic_sync':self.auto_sync_enabled},handle)
     def build_ui(self):
         bar=ttk.Frame(self,padding=6); bar.pack(fill='x')
         for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('删除连接',self.delete_profile),('同步管理',self.sync_manager),('自动同步：开/关',self.toggle_auto_sync),('后退',self.go_back),('前进',self.go_forward),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
@@ -214,7 +222,7 @@ class App(tk.Tk):
         if not sel:return
         self.session=RemoteClient(next(p for p in self.profiles if str(p['id'])==sel[0])); self.path='/'; self.history=['/']; self.history_index=0; self.status.set(f'{self.session.p["name"]}  |  {self.session.p["protocol"]}  |  已连接'); self.refresh()
     def toggle_auto_sync(self):
-        self.auto_sync_enabled=not self.auto_sync_enabled; messagebox.showinfo('自动同步', '已启用' if self.auto_sync_enabled else '已停用', parent=self)
+        self.auto_sync_enabled=not self.auto_sync_enabled; self.save_settings(); messagebox.showinfo('自动同步', '已启用' if self.auto_sync_enabled else '已停用', parent=self)
     def connection_menu(self,event):
         iid=self.conn.identify_row(event.y)
         if iid:self.conn.selection_set(iid)
@@ -379,7 +387,7 @@ class App(tk.Tk):
         checks=[]
         for row,(label,key,default) in enumerate([('本地新增/修改上传','upload',True),('远端新增/修改下载','download',False),('本地删除同步到远端','delete_remote',False),('远端删除同步到本地','delete_local',False),('检测本地变化自动同步','watch',False)],2):
             v=tk.BooleanVar(value=(old or {}).get(key,default)); checks.append((key,v)); ttk.Checkbutton(w,text=label,variable=v).grid(row=row,column=1,sticky='w',padx=8,pady=3)
-        ttk.Label(w,text='冲突策略').grid(row=7,column=0,padx=8,pady=6); conflict=tk.StringVar(value=(old or {}).get('conflict','keep_newest')); ttk.Combobox(w,textvariable=conflict,values=('keep_newest','keep_local','keep_remote'),state='readonly').grid(row=7,column=1,sticky='w',padx=8)
+        ttk.Label(w,text='冲突策略').grid(row=7,column=0,padx=8,pady=6); conflict=tk.StringVar(value=(old or {}).get('conflict','keep_newest')); ttk.Combobox(w,textvariable=conflict,values=('keep_newest','keep_local','keep_remote','duplicate'),state='readonly').grid(row=7,column=1,sticky='w',padx=8)
         ttk.Label(w,text='同步间隔(分钟)').grid(row=8,column=0,padx=8,pady=6); interval=tk.IntVar(value=(old or {}).get('interval',15)); ttk.Spinbox(w,from_=1,to=1440,textvariable=interval,width=8).grid(row=8,column=1,sticky='w',padx=8)
         def save():
             r=old or {'id':str(uuid.uuid4()),'enabled':True}; r.update({k:v.get() for k,v in vars.items()}); r.update({k:v.get() for k,v in checks}); r['conflict']=conflict.get(); r['interval']=max(1,interval.get());

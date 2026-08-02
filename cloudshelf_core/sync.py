@@ -3,6 +3,7 @@ import os
 import posixpath
 import shutil
 import time
+import tempfile
 
 from .paths import join, norm
 
@@ -112,7 +113,16 @@ class SyncEngine:
                         self.client.mkdir(current)
                     except Exception:
                         pass
-                self.client.upload(local_item['path'], join(remote_root, parent))
+                upload_path = local_item['path']
+                temporary = None
+                if conflict == 'duplicate' and remote_item is not None:
+                    temporary = os.path.join(tempfile.gettempdir(), os.path.basename(upload_path) + '.local-' + str(int(time.time())))
+                    shutil.copy2(upload_path, temporary)
+                    upload_path = temporary
+                self.client.upload(upload_path, join(remote_root, parent))
+                if temporary:
+                    try: os.remove(temporary)
+                    except OSError: pass
                 report['uploaded'] += 1
                 self.progress(f'上传 {relative}')
 
@@ -129,7 +139,10 @@ class SyncEngine:
                     or (conflict == 'keep_newest' and self.remote_mtime(remote_item['item']) > local_time)
                 )
                 if changed:
-                    self.client.download(remote_item['item'], path)
+                    destination = path
+                    if conflict == 'duplicate' and os.path.exists(path):
+                        destination = path + '.remote-' + str(int(time.time()))
+                    self.client.download(remote_item['item'], destination)
                     report['downloaded'] += 1
                     self.progress(f'下载 {relative}')
 

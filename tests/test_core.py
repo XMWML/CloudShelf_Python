@@ -91,6 +91,16 @@ class CoreTests(unittest.TestCase):
             SyncEngine(client, rule).run()
             self.assertEqual(client.deletes, ['/sync/old.txt'])
 
+    def test_duplicate_conflict_creates_second_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            local = os.path.join(directory, 'local'); os.makedirs(local)
+            with open(os.path.join(local, 'same.txt'), 'wb') as handle: handle.write(b'local')
+            client = FakeClient(); client.items['/sync/same.txt'] = {'directory': False, 'size': 6}
+            rule = {'local': local, 'remote': '/sync', 'upload': True, 'download': False, 'conflict': 'duplicate'}
+            report = SyncEngine(client, rule).run()
+            self.assertEqual(report['uploaded'], 1)
+            self.assertTrue(any('.local-' in path for path in client.uploads))
+
 
 if __name__ == '__main__':
     unittest.main()
