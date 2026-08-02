@@ -81,6 +81,7 @@ python3 -m pip install keyring
 
 - 当前传输任务显示状态和字节级进度（WebDAV）或文件级进度（FTP/SFTP）。
 - 文件夹传输支持暂停、继续、取消和失败后重试；单个底层网络请求会在完成后响应任务控制。
+- 传输使用最多 3 个后台工作线程，超出的任务会排队。
 - 自动同步使用跨平台轮询指纹，不依赖系统专用文件监控 API。
 - FTP 操作依赖系统 `curl`，SFTP 操作依赖系统 OpenSSH 客户端。
 - 不提供 Finder、Windows Explorer 或 Linux 文件管理器中的系统级网络挂载。

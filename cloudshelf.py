@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, posixpath, shutil, subprocess, tempfile, threading, uuid, urllib.parse, urllib.request, urllib.error, time, email.utils
+import concurrent.futures, json, os, posixpath, shutil, subprocess, tempfile, threading, uuid, urllib.parse, urllib.request, urllib.error, time, email.utils
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -215,8 +215,8 @@ RemoteClient = CoreRemoteClient
 class App(TkBase):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}; self.sync_scan_busy=False
-        self.load_profiles(); self.load_settings(); self.build_ui(); self.refresh_profiles(); self.after(5000,self.auto_sync)
+        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}; self.sync_scan_busy=False; self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        self.protocol('WM_DELETE_WINDOW',self.close_app); self.load_profiles(); self.load_settings(); self.build_ui(); self.refresh_profiles(); self.after(5000,self.auto_sync)
     def load_profiles(self):
         self.profiles=ProfileStore(PROFILE_FILE).load()
     def save_profiles(self):
@@ -257,7 +257,9 @@ class App(TkBase):
             try: result=fn(); self.after(0,lambda: ok(result) if ok else None)
             except TaskCancelled: self.after(0,lambda:self.update_transfer(iid,'已取消','-') if iid else None)
             except Exception as e: self.after(0,lambda:(self.update_transfer(iid,'失败','-') if iid else None, messagebox.showerror('操作失败',str(e))))
-        threading.Thread(target=run,daemon=True).start()
+        self.executor.submit(run)
+    def close_app(self):
+        self.executor.shutdown(wait=False,cancel_futures=True); self.destroy()
     def refresh(self):
         if not self.session:return
         self.worker(lambda:self.session.list(self.path),self.show_items)
