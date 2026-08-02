@@ -215,7 +215,7 @@ RemoteClient = CoreRemoteClient
 class App(TkBase):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}; self.sync_scan_busy=False; self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.progress_stats={}; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}; self.sync_scan_busy=False; self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=3)
         self.protocol('WM_DELETE_WINDOW',self.close_app); self.load_profiles(); self.load_settings(); self.build_ui(); self.refresh_profiles(); self.after(5000,self.auto_sync)
     def load_profiles(self):
         self.profiles=ProfileStore(PROFILE_FILE).load()
@@ -337,7 +337,7 @@ class App(TkBase):
     def upload_path(self,path,iid=None,cancel=None):
         if cancel: cancel.checkpoint()
         if not os.path.isdir(path):
-            result=self.session.upload(path,self.path,progress=(lambda done,total:self.after(0,lambda:self.update_transfer(iid,'上传中',f'{done/total:.0%}')) if iid and total else None))
+            result=self.session.upload(path,self.path,progress=(lambda done,total:self.after(0,lambda:self.report_progress(iid,'上传中',done,total)) if iid and total else None))
             if iid:self.after(0,lambda:self.update_transfer(iid,'上传中','100%'))
             return result
         target=join(self.path,os.path.basename(path))
@@ -350,7 +350,7 @@ class App(TkBase):
                 except Exception:pass
             for name in files:
                 if cancel: cancel.checkpoint()
-                file_path=os.path.join(root,name); self.session.upload(file_path,remote,progress=(lambda done,total:self.after(0,lambda:self.update_transfer(iid,'上传中',f'{done/total:.0%}')) if iid and total else None))
+                file_path=os.path.join(root,name); self.session.upload(file_path,remote,progress=(lambda done,total:self.after(0,lambda:self.report_progress(iid,'上传中',done,total)) if iid and total else None))
                 if iid:self.after(0,lambda name=name:self.update_transfer(iid,'上传中',name))
     def download(self):
         xs=self.selected();
@@ -366,7 +366,7 @@ class App(TkBase):
             os.makedirs(target,exist_ok=True)
             for child in self.session.list(item['path']):self.download_path(child,target,iid,cancel)
         else:
-            self.session.download(item,target,progress=(lambda done,total: self.after(0,lambda:self.update_transfer(iid,'下载中',f'{done/total:.0%}' if total else f'{done} B')) if iid else None))
+            self.session.download(item,target,progress=(lambda done,total: self.after(0,lambda:self.report_progress(iid,'下载中',done,total)) if iid else None))
             if iid:self.after(0,lambda:self.update_transfer(iid,'下载中','文件完成'))
     def destination(self,title): return simpledialog.askstring(title,'目标远端目录：',initialvalue=self.path,parent=self)
     def copy(self):
@@ -381,6 +381,14 @@ class App(TkBase):
         iid=str(uuid.uuid4()); self.transfer.insert('',0,iid=iid,text=title,values=(state,progress)); return iid
     def update_transfer(self,iid,state,progress):
         if self.transfer.exists(iid): self.transfer.item(iid,values=(state,progress))
+    def report_progress(self,iid,state,done,total):
+        now=time.monotonic(); previous=self.progress_stats.get(iid); rate=0
+        if previous:
+            elapsed=now-previous[0]
+            if elapsed>0: rate=max(0,done-previous[1])/elapsed
+        self.progress_stats[iid]=(now,done)
+        percent=f'{done/total:.0%}' if total else fmt_size(done)
+        self.update_transfer(iid,state,f'{percent} · {fmt_size(rate)}/s' if rate else percent)
     def cancel_task(self):
         for iid in self.transfer.selection():
             task=self.jobs.get(iid)
