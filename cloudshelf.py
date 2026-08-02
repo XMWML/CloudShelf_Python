@@ -335,7 +335,7 @@ class App(TkBase):
     def upload_path(self,path,iid=None,cancel=None):
         if cancel: cancel.checkpoint()
         if not os.path.isdir(path):
-            result=self.session.upload(path,self.path)
+            result=self.session.upload(path,self.path,progress=(lambda done,total:self.after(0,lambda:self.update_transfer(iid,'上传中',f'{done/total:.0%}')) if iid and total else None))
             if iid:self.after(0,lambda:self.update_transfer(iid,'上传中','100%'))
             return result
         target=join(self.path,os.path.basename(path))
@@ -348,7 +348,7 @@ class App(TkBase):
                 except Exception:pass
             for name in files:
                 if cancel: cancel.checkpoint()
-                self.session.upload(os.path.join(root,name),remote)
+                file_path=os.path.join(root,name); self.session.upload(file_path,remote,progress=(lambda done,total:self.after(0,lambda:self.update_transfer(iid,'上传中',f'{done/total:.0%}')) if iid and total else None))
                 if iid:self.after(0,lambda name=name:self.update_transfer(iid,'上传中',name))
     def download(self):
         xs=self.selected();

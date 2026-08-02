@@ -1,4 +1,5 @@
 import base64
+import http.client
 import os
 import posixpath
 import shutil
@@ -181,12 +182,22 @@ class RemoteClient:
                 handle.write(chunk); completed += len(chunk)
                 if progress: progress(completed, total)
 
-    def upload(self, local, directory):
+    def upload(self, local, directory, progress=None):
         target = join(directory, os.path.basename(local))
         if self.protocol == 'SFTP':
             return self._sftp_command(['put -p ' + self._quote(local) + ' ' + self._quote(target)])
         if self.protocol == 'FTP':
             return self._curl(['--url', self.url(target), '--upload-file', local])
+        parsed=urllib.parse.urlparse(self.url(target)); connection=http.client.HTTPSConnection(parsed.hostname,parsed.port,timeout=60) if parsed.scheme=='https' else http.client.HTTPConnection(parsed.hostname,parsed.port,timeout=60)
+        size=os.path.getsize(local); headers={'Authorization':'Basic '+base64.b64encode(f'{self.profile.get("username","")}:{self.password}'.encode()).decode(),'Content-Length':str(size)}; connection.putrequest('PUT',parsed.path or '/'); [connection.putheader(k,v) for k,v in headers.items()]; connection.endheaders(); sent=0
+        with open(local,'rb') as handle:
+            while True:
+                chunk=handle.read(1024*128)
+                if not chunk: break
+                connection.send(chunk); sent+=len(chunk)
+                if progress: progress(sent,size)
+        response=connection.getresponse(); body=response.read(); connection.close()
+        if response.status >= 400: raise RuntimeError(f'WebDAV upload failed: HTTP {response.status} {body.decode(errors="replace")}')
         with open(local, 'rb') as handle:
             return self._request('PUT', target, handle.read())
 
