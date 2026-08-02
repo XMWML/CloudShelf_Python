@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, posixpath, shutil, subprocess, threading, uuid, urllib.parse, urllib.request, urllib.error, time
+import json, os, posixpath, shutil, subprocess, tempfile, threading, uuid, urllib.parse, urllib.request, urllib.error, time
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -61,18 +61,45 @@ class RemoteClient:
             size=next((x.text for x in response.iter() if x.tag.split('}')[-1]=='getcontentlength'), None)
             out.append({'name':name,'path':join(path,name),'directory':isdir,'size':int(size) if size and size.isdigit() else None,'modified':next((x.text for x in response.iter() if x.tag.split('}')[-1]=='getlastmodified'), '-')})
         return sorted(out,key=lambda x:(not x['directory'],x['name'].lower()))
+    def sftp_exec(self, commands):
+        cmd=['sftp','-q','-P',str(self.p['port']),'-o','StrictHostKeyChecking='+('yes' if self.p.get('host_key_policy')=='strict' else 'accept-new')]
+        if self.p.get('private_key'): cmd += ['-i',self.p['private_key']]
+        cmd += [f'{self.p.get("username","")}@{self.p["host"]}']; env=os.environ.copy(); secret=None; askpass=None
+        if self.p.get('auth','password')=='password' and self.password:
+            secret=tempfile.NamedTemporaryFile(mode='w',delete=False); secret.write(self.password); secret.close(); os.chmod(secret.name,0o600)
+            askpass=tempfile.NamedTemporaryFile(mode='w',delete=False); askpass.write('#!/bin/sh\ncat "$CLOUDSHELF_ASKPASS_FILE"\n'); askpass.close(); os.chmod(askpass.name,0o700)
+            env.update({'CLOUDSHELF_ASKPASS_FILE':secret.name,'SSH_ASKPASS':askpass.name,'SSH_ASKPASS_REQUIRE':'force','DISPLAY':'cloudshelf:0'})
+        try: return subprocess.check_output(cmd,input=('\n'.join(commands)+'\n').encode(),stderr=subprocess.STDOUT,timeout=120,env=env).decode(errors='replace')
+        finally:
+            for f in (secret,askpass):
+                if f:
+                    try:os.remove(f.name)
+                    except OSError:pass
     def request(self, method, path, data=None, headers=None):
         req=urllib.request.Request(self.url(path), data=data, method=method, headers=headers or {})
         import base64; req.add_header('Authorization','Basic '+base64.b64encode(f'{self.p.get("username","")}:{self.password}'.encode()).decode())
         with urllib.request.urlopen(req,timeout=30) as r: return r.read()
-    def mkdir(self, path): self.request('MKCOL',path)
-    def delete(self, path): self.request('DELETE',path)
-    def rename(self, old, new): self.request('MOVE',old,headers={'Destination':self.url(new),'Overwrite':'T'})
+    def mkdir(self, path):
+        if self.p['protocol']=='SFTP': return self.sftp_exec(['mkdir '+self.quote(path)])
+        return self.request('MKCOL',path)
+    def delete(self, path):
+        if self.p['protocol']=='SFTP': return self.sftp_exec(['rm -r '+self.quote(path)])
+        return self.request('DELETE',path)
+    def rename(self, old, new):
+        if self.p['protocol']=='SFTP': return self.sftp_exec(['rename '+self.quote(old)+' '+self.quote(new)])
+        return self.request('MOVE',old,headers={'Destination':self.url(new),'Overwrite':'T'})
     def download(self, item, target):
-        os.makedirs(os.path.dirname(target),exist_ok=True); open(target,'wb').write(self.request('GET',item['path']))
-    def upload(self, local, directory): self.request('PUT',join(directory,os.path.basename(local)),open(local,'rb').read())
+        os.makedirs(os.path.dirname(target),exist_ok=True)
+        if self.p['protocol']=='SFTP': return self.sftp_exec(['get -p '+self.quote(item['path'])+' '+self.quote(target)])
+        open(target,'wb').write(self.request('GET',item['path']))
+    def upload(self, local, directory):
+        if self.p['protocol']=='SFTP': return self.sftp_exec(['put -p '+self.quote(local)+' '+self.quote(join(directory,os.path.basename(local)))])
+        with open(local,'rb') as f: return self.request('PUT',join(directory,os.path.basename(local)),f.read())
+    def quote(self,value): return '"'+str(value).replace('\\','\\\\').replace('"','\\"')+'"'
     def copy(self, item, directory):
         target=join(directory,item['name'])
+        if self.p['protocol']=='SFTP':
+            self.sftp_exec(['cp '+self.quote(item['path'])+' '+self.quote(target)]); return
         if self.p['protocol']=='WebDAV':
             self.request('COPY',item['path'],headers={'Destination':self.url(target),'Overwrite':'T'}); return
         if item['directory']:
@@ -85,6 +112,8 @@ class RemoteClient:
                 if os.path.exists(tmp): os.remove(tmp)
     def move(self, item, directory):
         target=join(directory,item['name'])
+        if self.p['protocol']=='SFTP':
+            self.sftp_exec(['rename '+self.quote(item['path'])+' '+self.quote(target)]); return
         if self.p['protocol']=='WebDAV':
             self.request('MOVE',item['path'],headers={'Destination':self.url(target),'Overwrite':'T'}); return
         if item['directory']:
@@ -217,11 +246,17 @@ class App(tk.Tk):
     def upload(self):
         if not self.session:return
         paths=filedialog.askopenfilenames(parent=self,title='选择要上传的文件')
-        for p in paths:self.worker(lambda p=p:self.upload_path(p),lambda _:self.add_transfer(os.path.basename(p),'上传完成'))
+        for p in paths:
+            iid=self.add_transfer(os.path.basename(p),'上传中','0%')
+            self.worker(lambda p=p,iid=iid:self.upload_path(p,iid),lambda _,iid=iid:self.update_transfer(iid,'上传完成','100%'))
         folder=filedialog.askdirectory(parent=self,title='或选择要上传的文件夹')
-        if folder:self.worker(lambda:self.upload_path(folder),lambda _:self.add_transfer(os.path.basename(folder),'文件夹上传完成'))
-    def upload_path(self,path):
-        if not os.path.isdir(path): return self.session.upload(path,self.path)
+        if folder:
+            iid=self.add_transfer(os.path.basename(folder),'上传中','0%'); self.worker(lambda iid=iid:self.upload_path(folder,iid),lambda _,iid=iid:self.update_transfer(iid,'文件夹上传完成','100%'))
+    def upload_path(self,path,iid=None):
+        if not os.path.isdir(path):
+            result=self.session.upload(path,self.path)
+            if iid:self.after(0,lambda:self.update_transfer(iid,'上传中','100%'))
+            return result
         target=join(self.path,os.path.basename(path))
         try:self.session.mkdir(target)
         except Exception:pass
@@ -230,19 +265,24 @@ class App(tk.Tk):
             for name in dirs:
                 try:self.session.mkdir(join(remote,name))
                 except Exception:pass
-            for name in files:self.session.upload(os.path.join(root,name),remote)
+            for name in files:
+                self.session.upload(os.path.join(root,name),remote)
+                if iid:self.after(0,lambda name=name:self.update_transfer(iid,'上传中',name))
     def download(self):
         xs=self.selected();
         if not self.session or not xs:return
         dest=filedialog.askdirectory(parent=self,title='选择下载目录');
         if dest:
-            for x in xs:self.worker(lambda x=x:self.download_path(x,dest),lambda _,name=x['name']:self.add_transfer(name,'下载完成'))
-    def download_path(self,item,dest):
+            for x in xs:
+                iid=self.add_transfer(x['name'],'下载中','0%'); self.worker(lambda x=x,iid=iid:self.download_path(x,dest,iid),lambda _,iid=iid:self.update_transfer(iid,'下载完成','100%'))
+    def download_path(self,item,dest,iid=None):
         target=os.path.join(dest,item['name'])
         if item['directory']:
             os.makedirs(target,exist_ok=True)
-            for child in self.session.list(item['path']):self.download_path(child,target)
-        else:self.session.download(item,target)
+            for child in self.session.list(item['path']):self.download_path(child,target,iid)
+        else:
+            self.session.download(item,target)
+            if iid:self.after(0,lambda:self.update_transfer(iid,'下载中','文件完成'))
     def destination(self,title): return simpledialog.askstring(title,'目标远端目录：',initialvalue=self.path,parent=self)
     def copy(self):
         xs=self.selected(); dest=self.destination('复制到') if xs else None
@@ -252,7 +292,10 @@ class App(tk.Tk):
         xs=self.selected(); dest=self.destination('移动到') if xs else None
         if dest:
             for x in xs:self.worker(lambda x=x:self.session.move(x,norm(dest)),lambda _,name=x['name']:self.add_transfer(name,'移动完成'))
-    def add_transfer(self,title,state): self.transfer.insert('',0,text=title,values=(state,))
+    def add_transfer(self,title,state,progress='-'):
+        iid=str(uuid.uuid4()); self.transfer.insert('',0,iid=iid,text=title,values=(state,progress)); return iid
+    def update_transfer(self,iid,state,progress):
+        if self.transfer.exists(iid): self.transfer.item(iid,values=(state,progress))
     def context_menu(self,e):
         iid=self.files.identify_row(e.y)
         if iid and iid!='__up__': self.files.selection_set(iid)
