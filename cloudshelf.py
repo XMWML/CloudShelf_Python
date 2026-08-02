@@ -69,6 +69,25 @@ class RemoteClient:
     def download(self, item, target):
         os.makedirs(os.path.dirname(target),exist_ok=True); open(target,'wb').write(self.request('GET',item['path']))
     def upload(self, local, directory): self.request('PUT',join(directory,os.path.basename(local)),open(local,'rb').read())
+    def copy(self, item, directory):
+        target=join(directory,item['name'])
+        if self.p['protocol']=='WebDAV':
+            self.request('COPY',item['path'],headers={'Destination':self.url(target),'Overwrite':'T'}); return
+        if item['directory']:
+            self.mkdir(target)
+            for child in self.list(item['path']): self.copy(child,target)
+        else:
+            tmp=os.path.join(APP_DIR,'copy-'+str(uuid.uuid4()))
+            try: self.download(item,tmp); self.upload(tmp,directory)
+            finally:
+                if os.path.exists(tmp): os.remove(tmp)
+    def move(self, item, directory):
+        target=join(directory,item['name'])
+        if self.p['protocol']=='WebDAV':
+            self.request('MOVE',item['path'],headers={'Destination':self.url(target),'Overwrite':'T'}); return
+        if item['directory']:
+            self.copy(item,directory); self.delete(item['path'])
+        else: self.rename(item['path'],target)
 
 class App(tk.Tk):
     def __init__(self):
@@ -82,7 +101,7 @@ class App(tk.Tk):
         os.makedirs(APP_DIR,exist_ok=True); json.dump(self.profiles,open(PROFILE_FILE,'w'),ensure_ascii=False,indent=2)
     def build_ui(self):
         bar=ttk.Frame(self,padding=6); bar.pack(fill='x')
-        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
+        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
         pan=ttk.PanedWindow(self,orient='horizontal'); pan.pack(fill='both',expand=True,padx=6,pady=4)
         left=ttk.Frame(pan,width=270); right=ttk.Frame(pan); pan.add(left,weight=1); pan.add(right,weight=4)
         ttk.Label(left,text='连接').pack(anchor='w'); self.conn=ttk.Treeview(left,columns=('protocol',),show='tree headings',selectmode='browse'); self.conn.heading('#0',text='连接'); self.conn.heading('protocol',text='协议'); self.conn.column('protocol',width=70); self.conn.pack(fill='both',expand=True); self.conn.bind('<<TreeviewSelect>>',self.select_profile)
@@ -132,18 +151,46 @@ class App(tk.Tk):
     def upload(self):
         if not self.session:return
         paths=filedialog.askopenfilenames(parent=self,title='选择要上传的文件')
-        for p in paths:self.worker(lambda p=p:self.session.upload(p,self.path),lambda _:self.add_transfer(os.path.basename(p),'上传完成'))
+        for p in paths:self.worker(lambda p=p:self.upload_path(p),lambda _:self.add_transfer(os.path.basename(p),'上传完成'))
+        folder=filedialog.askdirectory(parent=self,title='或选择要上传的文件夹')
+        if folder:self.worker(lambda:self.upload_path(folder),lambda _:self.add_transfer(os.path.basename(folder),'文件夹上传完成'))
+    def upload_path(self,path):
+        if not os.path.isdir(path): return self.session.upload(path,self.path)
+        target=join(self.path,os.path.basename(path))
+        try:self.session.mkdir(target)
+        except Exception:pass
+        for root,dirs,files in os.walk(path):
+            rel=os.path.relpath(root,path); remote=target if rel=='.' else join(target,rel)
+            for name in dirs:
+                try:self.session.mkdir(join(remote,name))
+                except Exception:pass
+            for name in files:self.session.upload(os.path.join(root,name),remote)
     def download(self):
         xs=self.selected();
         if not self.session or not xs:return
         dest=filedialog.askdirectory(parent=self,title='选择下载目录');
         if dest:
-            for x in xs:self.worker(lambda x=x:self.session.download(x,os.path.join(dest,x['name'])),lambda _:self.add_transfer(x['name'],'下载完成'))
+            for x in xs:self.worker(lambda x=x:self.download_path(x,dest),lambda _,name=x['name']:self.add_transfer(name,'下载完成'))
+    def download_path(self,item,dest):
+        target=os.path.join(dest,item['name'])
+        if item['directory']:
+            os.makedirs(target,exist_ok=True)
+            for child in self.session.list(item['path']):self.download_path(child,target)
+        else:self.session.download(item,target)
+    def destination(self,title): return simpledialog.askstring(title,'目标远端目录：',initialvalue=self.path,parent=self)
+    def copy(self):
+        xs=self.selected(); dest=self.destination('复制到') if xs else None
+        if dest:
+            for x in xs:self.worker(lambda x=x:self.session.copy(x,norm(dest)),lambda _,name=x['name']:self.add_transfer(name,'复制完成'))
+    def move(self):
+        xs=self.selected(); dest=self.destination('移动到') if xs else None
+        if dest:
+            for x in xs:self.worker(lambda x=x:self.session.move(x,norm(dest)),lambda _,name=x['name']:self.add_transfer(name,'移动完成'))
     def add_transfer(self,title,state): self.transfer.insert('',0,text=title,values=(state,))
     def context_menu(self,e):
         iid=self.files.identify_row(e.y)
         if iid and iid!='__up__': self.files.selection_set(iid)
-        m=tk.Menu(self,tearoff=0); m.add_command(label='打开',command=self.open_item); m.add_command(label='下载',command=self.download); m.add_command(label='重命名',command=self.rename); m.add_command(label='删除',command=self.delete); m.post(e.x_root,e.y_root)
+        m=tk.Menu(self,tearoff=0); m.add_command(label='打开',command=self.open_item); m.add_command(label='下载',command=self.download); m.add_command(label='复制到',command=self.copy); m.add_command(label='移动到',command=self.move); m.add_command(label='重命名',command=self.rename); m.add_command(label='删除',command=self.delete); m.post(e.x_root,e.y_root)
     def add_profile(self): self.profile_dialog()
     def edit_profile(self):
         sel=self.conn.selection();
