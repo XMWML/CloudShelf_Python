@@ -57,6 +57,10 @@ class CoreTests(unittest.TestCase):
         client = RemoteClient({'host': 'example.com', 'port': 22, 'protocol': 'SFTP'})
         self.assertIs(client.p, client.profile)
         self.assertTrue(client.url('/').startswith('sftp://example.com:22/'))
+        ftps = RemoteClient({'host': 'ftps://files.example.com:990/backups', 'port': 21, 'protocol': 'FTP'})
+        self.assertEqual(ftps.p['host'], 'files.example.com')
+        self.assertEqual(ftps.p['base_path'], '/backups')
+        self.assertTrue(ftps.url('/').startswith('ftps://files.example.com:990/'))
 
     def test_profile_migration_and_permissions(self):
         with tempfile.TemporaryDirectory() as directory:

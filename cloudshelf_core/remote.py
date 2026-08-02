@@ -14,6 +14,17 @@ from .paths import join, norm
 
 class RemoteClient:
     def __init__(self, profile):
+        profile = dict(profile)
+        address = str(profile.get('host', '')).strip()
+        if '://' in address:
+            parsed = urllib.parse.urlparse(address)
+            expected = {'FTP': ('ftp', 'ftps'), 'SFTP': ('sftp',), 'WebDAV': ('http', 'https')}[profile.get('protocol', 'FTP')]
+            if parsed.scheme.lower() not in expected or not parsed.hostname:
+                raise ValueError('服务器 URL 与连接协议不匹配')
+            profile['host'] = parsed.hostname
+            profile['port'] = parsed.port or profile.get('port', 21)
+            profile['base_path'] = norm(parsed.path or profile.get('base_path', '/'))
+            profile['tls'] = parsed.scheme.lower() in ('ftps', 'https')
         self.profile = profile
         self.p = profile
         self.password = profile.get('password', '')
