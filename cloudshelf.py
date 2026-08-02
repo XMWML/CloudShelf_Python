@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, posixpath, subprocess, threading, uuid, urllib.parse, urllib.request, urllib.error
+import json, os, posixpath, shutil, subprocess, threading, uuid, urllib.parse, urllib.request, urllib.error, time
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -89,11 +89,58 @@ class RemoteClient:
             self.copy(item,directory); self.delete(item['path'])
         else: self.rename(item['path'],target)
 
+class SyncEngine:
+    def __init__(self, client, rule, progress=None):
+        self.client,self.rule,self.progress=client,rule,progress or (lambda _:None)
+    def local_inventory(self):
+        root=os.path.abspath(self.rule['local']); out={}
+        for base,dirs,files in os.walk(root):
+            rel=os.path.relpath(base,root)
+            if rel!='.': out[rel]={'directory':True}
+            for name in files:
+                p=os.path.join(base,name); out[os.path.relpath(p,root)]={'directory':False,'size':os.path.getsize(p),'path':p}
+        return out
+    def remote_inventory(self, folder):
+        out={}
+        def visit(path):
+            for item in self.client.list(path):
+                rel=posixpath.relpath(item['path'],folder); out[rel]={'item':item,'directory':item['directory'],'size':item.get('size')}
+                if item['directory']: visit(item['path'])
+        visit(folder); return out
+    def run(self):
+        root=os.path.abspath(self.rule['local']); os.makedirs(root,exist_ok=True); remote_root=norm(self.rule['remote'])
+        local=self.local_inventory(); remote=self.remote_inventory(remote_root); report={'uploaded':0,'downloaded':0,'deleted_local':0,'deleted_remote':0}
+        previous=self.rule.get('snapshot',{'local':[],'remote':[]})
+        if self.rule.get('delete_remote'):
+            for rel in set(previous['local'])-set(local):
+                if rel in remote: self.client.delete(remote[rel]['item']['path']); report['deleted_remote']+=1
+        if self.rule.get('delete_local'):
+            for rel in set(previous['remote'])-set(remote):
+                p=os.path.join(root,rel)
+                if os.path.exists(p): shutil.rmtree(p) if os.path.isdir(p) else os.remove(p); report['deleted_local']+=1
+        if self.rule.get('upload',True):
+            for rel,data in local.items():
+                if data['directory']: continue
+                if rel not in remote or remote[rel]['size']!=data['size']:
+                    parent=posixpath.dirname(rel); current=remote_root
+                    for part in [x for x in parent.split('/') if x]:
+                        current=join(current,part)
+                        try:self.client.mkdir(current)
+                        except Exception:pass
+                    self.client.upload(data['path'],join(remote_root,parent)); report['uploaded']+=1; self.progress('上传 '+rel)
+        if self.rule.get('download'):
+            for rel,data in remote.items():
+                if data['directory']: continue
+                p=os.path.join(root,rel); os.makedirs(os.path.dirname(p),exist_ok=True)
+                if not os.path.exists(p) or os.path.getsize(p)!=data['size']:
+                    self.client.download(data['item'],p); report['downloaded']+=1; self.progress('下载 '+rel)
+        self.rule['snapshot']={'local':list(self.local_inventory()),'remote':list(self.remote_inventory(remote_root))}; self.rule['last_sync']=time.time(); return report
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
         self.profiles=[]; self.session=None; self.path='/'; self.items=[]; self.transfers=[]
-        self.load_profiles(); self.build_ui(); self.refresh_profiles()
+        self.load_profiles(); self.build_ui(); self.refresh_profiles(); self.after(60000,self.auto_sync)
     def load_profiles(self):
         try: self.profiles=json.load(open(PROFILE_FILE))
         except (OSError,ValueError): self.profiles=[]
@@ -101,7 +148,7 @@ class App(tk.Tk):
         os.makedirs(APP_DIR,exist_ok=True); json.dump(self.profiles,open(PROFILE_FILE,'w'),ensure_ascii=False,indent=2)
     def build_ui(self):
         bar=ttk.Frame(self,padding=6); bar.pack(fill='x')
-        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
+        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('同步管理',self.sync_manager),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
         pan=ttk.PanedWindow(self,orient='horizontal'); pan.pack(fill='both',expand=True,padx=6,pady=4)
         left=ttk.Frame(pan,width=270); right=ttk.Frame(pan); pan.add(left,weight=1); pan.add(right,weight=4)
         ttk.Label(left,text='连接').pack(anchor='w'); self.conn=ttk.Treeview(left,columns=('protocol',),show='tree headings',selectmode='browse'); self.conn.heading('#0',text='连接'); self.conn.heading('protocol',text='协议'); self.conn.column('protocol',width=70); self.conn.pack(fill='both',expand=True); self.conn.bind('<<TreeviewSelect>>',self.select_profile)
@@ -195,18 +242,67 @@ class App(tk.Tk):
     def edit_profile(self):
         sel=self.conn.selection();
         if sel:self.profile_dialog(next(p for p in self.profiles if str(p['id'])==sel[0]))
+    def sync_manager(self):
+        if not self.session:return
+        w=tk.Toplevel(self); w.title('同步管理'); w.geometry('820x400'); w.transient(self)
+        tree=ttk.Treeview(w,columns=('remote','mode','state','last'),show='headings');
+        for c,t in [('remote','远端目录'),('mode','同步操作'),('state','状态'),('last','上次同步')]: tree.heading(c,text=t)
+        tree.pack(fill='both',expand=True,padx=8,pady=8)
+        rules=self.session.p.setdefault('sync_rules',[])
+        def reload():
+            tree.delete(*tree.get_children())
+            for i,r in enumerate(rules): tree.insert('', 'end',iid=str(i),values=(r.get('remote','/'),('上传' if r.get('upload',True) else '')+(' 下载' if r.get('download') else ''), '已启用' if r.get('enabled',True) else '已停用', time.strftime('%Y-%m-%d %H:%M',time.localtime(r['last_sync'])) if r.get('last_sync') else '从未'))
+        def edit():
+            sel=tree.selection(); old=rules[int(sel[0])] if sel else None; self.rule_dialog(rules,old,reload)
+        def run():
+            sel=tree.selection();
+            if sel:self.run_rule(rules[int(sel[0])],reload)
+        def toggle():
+            sel=tree.selection();
+            if sel: rules[int(sel[0])]['enabled']=not rules[int(sel[0])].get('enabled',True); self.save_profiles(); reload()
+        def remove():
+            sel=tree.selection();
+            if sel: rules.pop(int(sel[0])); self.save_profiles(); reload()
+        b=ttk.Frame(w); b.pack(fill='x',padx=8,pady=8)
+        for text,cmd in [('添加规则',edit),('编辑',edit),('启用/停用',toggle),('立即执行',run),('删除',remove)]: ttk.Button(b,text=text,command=cmd).pack(side='left',padx=3)
+        reload()
+    def rule_dialog(self,rules,old,reload):
+        w=tk.Toplevel(self); w.title('编辑同步规则' if old else '添加同步规则'); vars={}
+        fields=[('本地文件夹','local'),('远端文件夹','remote')]
+        for row,(label,key) in enumerate(fields): ttk.Label(w,text=label).grid(row=row,column=0,padx=8,pady=6); v=tk.StringVar(value=(old or {}).get(key,'/' if key=='remote' else '')); vars[key]=v; ttk.Entry(w,textvariable=v,width=48).grid(row=row,column=1,padx=8,pady=6)
+        checks=[]
+        for row,(label,key,default) in enumerate([('本地新增/修改上传','upload',True),('远端新增/修改下载','download',False),('本地删除同步到远端','delete_remote',False),('远端删除同步到本地','delete_local',False),('检测本地变化自动同步','watch',False)],2):
+            v=tk.BooleanVar(value=(old or {}).get(key,default)); checks.append((key,v)); ttk.Checkbutton(w,text=label,variable=v).grid(row=row,column=1,sticky='w',padx=8,pady=3)
+        ttk.Label(w,text='同步间隔(分钟)').grid(row=7,column=0,padx=8,pady=6); interval=tk.IntVar(value=(old or {}).get('interval',15)); ttk.Spinbox(w,from_=1,to=1440,textvariable=interval,width=8).grid(row=7,column=1,sticky='w',padx=8)
+        def save():
+            r=old or {'id':str(uuid.uuid4()),'enabled':True}; r.update({k:v.get() for k,v in vars.items()}); r.update({k:v.get() for k,v in checks}); r['interval']=max(1,interval.get());
+            if not old: rules.append(r)
+            self.save_profiles(); w.destroy(); reload()
+        ttk.Button(w,text='保存',command=save).grid(row=8,column=1,sticky='e',padx=8,pady=10)
+    def run_rule(self,rule,reload=lambda:None):
+        if not rule.get('enabled',True): return
+        def job():
+            report=SyncEngine(self.session,rule,lambda s: self.after(0,lambda:self.add_transfer('同步',s))).run(); self.save_profiles(); return report
+        self.worker(job,lambda report:(self.add_transfer('同步',f"完成：上传 {report['uploaded']}，下载 {report['downloaded']}，删除 {report['deleted_remote']+report['deleted_local']}"),reload()))
+    def auto_sync(self):
+        if self.session:
+            for rule in self.session.p.get('sync_rules',[]):
+                if rule.get('watch') and rule.get('last_sync',0)+rule.get('interval',15)*60<=time.time(): self.run_rule(rule)
+        self.after(60000,self.auto_sync)
     def profile_dialog(self,old=None):
         w=tk.Toplevel(self); w.title('编辑连接' if old else '新建连接'); w.transient(self); w.grab_set(); vars={}
-        fields=[('名称','name'),('协议','protocol'),('服务器地址','host'),('端口','port'),('用户名','username'),('密码','password'),('远端根目录','base_path')]
+        fields=[('名称','name'),('协议','protocol'),('服务器地址','host'),('端口','port'),('用户名','username'),('密码','password'),('远端根目录','base_path'),('认证方式','auth'),('私钥路径','private_key'),('主机密钥策略','host_key_policy')]
         for r,(label,key) in enumerate(fields):
             ttk.Label(w,text=label).grid(row=r,column=0,sticky='w',padx=10,pady=5)
             v=tk.StringVar(value=str((old or {}).get(key, {'protocol':'FTP','port':'21','base_path':'/'}.get(key,''))))
             vars[key]=v
             if key == 'protocol': ent=ttk.Combobox(w,textvariable=v,values=('FTP','SFTP','WebDAV'),state='readonly')
+            elif key == 'auth': ent=ttk.Combobox(w,textvariable=v,values=('password','ssh_agent','private_key'),state='readonly')
+            elif key == 'host_key_policy': ent=ttk.Combobox(w,textvariable=v,values=('accept-new','strict'),state='readonly')
             else: ent=ttk.Entry(w,textvariable=v,show='*' if key=='password' else '')
             ent.grid(row=r,column=1,padx=10,pady=5)
         def save():
-            try: p={k:v.get() for k,v in vars.items()}; p['id']=(old or {}).get('id',str(uuid.uuid4())); p['port']=int(p['port']); p['tls']=p['protocol']=='WebDAV';
+            try: p={k:v.get() for k,v in vars.items()}; p['id']=(old or {}).get('id',str(uuid.uuid4())); p['port']=int(p['port']); p['tls']=p['protocol']=='WebDAV'; p['sync_rules']=(old or {}).get('sync_rules',[])
             except ValueError: messagebox.showerror('输入错误','端口必须是数字',parent=w); return
             if old:self.profiles=[p if x['id']==old['id'] else x for x in self.profiles]
             else:self.profiles.append(p)
