@@ -19,6 +19,10 @@ APP_DIR = os.path.join(os.path.expanduser('~'), '.cloudshelf')
 PROFILE_FILE = os.path.join(APP_DIR, 'connections.json')
 SETTINGS_FILE = os.path.join(APP_DIR, 'settings.json')
 
+
+class TaskCancelled(Exception):
+    pass
+
 def norm(p):
     p = '/' + (p or '').strip().strip('/')
     return posixpath.normpath(p).replace('//', '/')
@@ -199,7 +203,7 @@ RemoteClient = CoreRemoteClient
 class App(TkBase):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}; self.sync_scan_busy=False
+        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}; self.sync_scan_busy=False
         self.load_profiles(); self.load_settings(); self.build_ui(); self.refresh_profiles(); self.after(5000,self.auto_sync)
     def load_profiles(self):
         self.profiles=ProfileStore(PROFILE_FILE).load()
@@ -223,7 +227,7 @@ class App(TkBase):
         self.files=ttk.Treeview(right,columns=('size','type','modified'),show='tree headings',selectmode='extended'); self.files.heading('#0',text='名称'); self.files.heading('size',text='大小'); self.files.heading('type',text='类型'); self.files.heading('modified',text='修改时间'); self.files.column('#0',width=430); self.files.column('size',width=100); self.files.column('type',width=100); self.files.pack(fill='both',expand=True); self.files.bind('<Double-1>',self.open_item); self.files.bind('<Button-3>',self.context_menu)
         if DND_FILES:
             self.files.drop_target_register(DND_FILES); self.files.dnd_bind('<<Drop>>',self.drop_upload)
-        ttk.Label(self,text='传输任务').pack(anchor='w',padx=8); self.transfer=ttk.Treeview(self,columns=('state','progress'),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.heading('progress',text='进度'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
+        transfer_head=ttk.Frame(self); transfer_head.pack(fill='x',padx=8); ttk.Label(transfer_head,text='传输任务').pack(side='left'); ttk.Button(transfer_head,text='重试失败',command=self.retry_task).pack(side='right',padx=3); ttk.Button(transfer_head,text='取消任务',command=self.cancel_task).pack(side='right'); self.transfer=ttk.Treeview(self,columns=('state','progress'),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.heading('progress',text='进度'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
     def refresh_profiles(self):
         self.conn.delete(*self.conn.get_children()); [self.conn.insert('', 'end', iid=str(p['id']), text=p['name'], values=(p['protocol'],)) for p in self.profiles]
     def select_profile(self,_=None):
@@ -236,10 +240,11 @@ class App(TkBase):
         iid=self.conn.identify_row(event.y)
         if iid:self.conn.selection_set(iid)
         menu=tk.Menu(self,tearoff=0); menu.add_command(label='连接',command=self.select_profile); menu.add_command(label='编辑',command=self.edit_profile); menu.add_command(label='删除',command=self.delete_profile); menu.post(event.x_root,event.y_root)
-    def worker(self, fn, ok=None):
+    def worker(self, fn, ok=None, iid=None):
         def run():
             try: result=fn(); self.after(0,lambda: ok(result) if ok else None)
-            except Exception as e: self.after(0,lambda: messagebox.showerror('操作失败',str(e)))
+            except TaskCancelled: self.after(0,lambda:self.update_transfer(iid,'已取消','-') if iid else None)
+            except Exception as e: self.after(0,lambda:(self.update_transfer(iid,'失败','-') if iid else None, messagebox.showerror('操作失败',str(e))))
         threading.Thread(target=run,daemon=True).start()
     def refresh(self):
         if not self.session:return
@@ -302,17 +307,21 @@ class App(TkBase):
         if not self.session:return
         paths=filedialog.askopenfilenames(parent=self,title='选择要上传的文件')
         for p in paths:
-            iid=self.add_transfer(os.path.basename(p),'上传中','0%')
-            self.worker(lambda p=p,iid=iid:self.upload_path(p,iid),lambda _,iid=iid:self.update_transfer(iid,'上传完成','100%'))
+            iid=self.add_transfer(os.path.basename(p),'上传中','0%'); self.jobs[iid]=threading.Event()
+            self.retry_jobs[iid]=lambda new_iid,event,p=p:self.upload_path(p,new_iid,event)
+            self.worker(lambda p=p,iid=iid:self.upload_path(p,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'上传完成','100%'),iid)
         folder=filedialog.askdirectory(parent=self,title='或选择要上传的文件夹')
         if folder:
-            iid=self.add_transfer(os.path.basename(folder),'上传中','0%'); self.worker(lambda iid=iid:self.upload_path(folder,iid),lambda _,iid=iid:self.update_transfer(iid,'文件夹上传完成','100%'))
+            iid=self.add_transfer(os.path.basename(folder),'上传中','0%'); self.jobs[iid]=threading.Event(); self.worker(lambda iid=iid:self.upload_path(folder,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'文件夹上传完成','100%'),iid)
+            self.retry_jobs[iid]=lambda new_iid,event,folder=folder:self.upload_path(folder,new_iid,event)
     def drop_upload(self,event):
         if not self.session:return
         for path in self.tk.splitlist(event.data):
-            iid=self.add_transfer(os.path.basename(path),'上传中','0%')
-            self.worker(lambda path=path,iid=iid:self.upload_path(path,iid),lambda _,iid=iid:self.update_transfer(iid,'上传完成','100%'))
-    def upload_path(self,path,iid=None):
+            iid=self.add_transfer(os.path.basename(path),'上传中','0%'); self.jobs[iid]=threading.Event()
+            self.retry_jobs[iid]=lambda new_iid,event,path=path:self.upload_path(path,new_iid,event)
+            self.worker(lambda path=path,iid=iid:self.upload_path(path,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'上传完成','100%'),iid)
+    def upload_path(self,path,iid=None,cancel=None):
+        if cancel and cancel.is_set(): raise TaskCancelled()
         if not os.path.isdir(path):
             result=self.session.upload(path,self.path)
             if iid:self.after(0,lambda:self.update_transfer(iid,'上传中','100%'))
@@ -326,6 +335,7 @@ class App(TkBase):
                 try:self.session.mkdir(join(remote,name))
                 except Exception:pass
             for name in files:
+                if cancel and cancel.is_set(): raise TaskCancelled()
                 self.session.upload(os.path.join(root,name),remote)
                 if iid:self.after(0,lambda name=name:self.update_transfer(iid,'上传中',name))
     def download(self):
@@ -334,12 +344,13 @@ class App(TkBase):
         dest=filedialog.askdirectory(parent=self,title='选择下载目录');
         if dest:
             for x in xs:
-                iid=self.add_transfer(x['name'],'下载中','0%'); self.worker(lambda x=x,iid=iid:self.download_path(x,dest,iid),lambda _,iid=iid:self.update_transfer(iid,'下载完成','100%'))
-    def download_path(self,item,dest,iid=None):
+                iid=self.add_transfer(x['name'],'下载中','0%'); self.jobs[iid]=threading.Event(); self.retry_jobs[iid]=lambda new_iid,event,x=x,dest=dest:self.download_path(x,dest,new_iid,event); self.worker(lambda x=x,iid=iid:self.download_path(x,dest,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'下载完成','100%'),iid)
+    def download_path(self,item,dest,iid=None,cancel=None):
+        if cancel and cancel.is_set(): raise TaskCancelled()
         target=os.path.join(dest,item['name'])
         if item['directory']:
             os.makedirs(target,exist_ok=True)
-            for child in self.session.list(item['path']):self.download_path(child,target,iid)
+            for child in self.session.list(item['path']):self.download_path(child,target,iid,cancel)
         else:
             self.session.download(item,target,progress=(lambda done,total: self.after(0,lambda:self.update_transfer(iid,'下载中',f'{done/total:.0%}' if total else f'{done} B')) if iid else None))
             if iid:self.after(0,lambda:self.update_transfer(iid,'下载中','文件完成'))
@@ -356,6 +367,16 @@ class App(TkBase):
         iid=str(uuid.uuid4()); self.transfer.insert('',0,iid=iid,text=title,values=(state,progress)); return iid
     def update_transfer(self,iid,state,progress):
         if self.transfer.exists(iid): self.transfer.item(iid,values=(state,progress))
+    def cancel_task(self):
+        for iid in self.transfer.selection():
+            task=self.jobs.get(iid)
+            if task: task.set(); self.update_transfer(iid,'取消中','-')
+    def retry_task(self):
+        for old_iid in self.transfer.selection():
+            starter=self.retry_jobs.get(old_iid)
+            if not starter: continue
+            title=self.transfer.item(old_iid,'text'); new_iid=self.add_transfer(title,'重试中','0%'); self.jobs[new_iid]=threading.Event(); self.retry_jobs[new_iid]=starter
+            self.worker(lambda new_iid=new_iid:self.retry_jobs[new_iid](new_iid,self.jobs[new_iid]),lambda _,new_iid=new_iid:self.update_transfer(new_iid,'完成','100%'),new_iid)
     def context_menu(self,e):
         iid=self.files.identify_row(e.y)
         if iid and iid!='__up__': self.files.selection_set(iid)
