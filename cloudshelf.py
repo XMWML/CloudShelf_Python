@@ -327,7 +327,7 @@ class App(tk.Tk):
             os.makedirs(target,exist_ok=True)
             for child in self.session.list(item['path']):self.download_path(child,target,iid)
         else:
-            self.session.download(item,target)
+            self.session.download(item,target,progress=(lambda done,total: self.after(0,lambda:self.update_transfer(iid,'下载中',f'{done/total:.0%}' if total else f'{done} B')) if iid else None))
             if iid:self.after(0,lambda:self.update_transfer(iid,'下载中','文件完成'))
     def destination(self,title): return simpledialog.askstring(title,'目标远端目录：',initialvalue=self.path,parent=self)
     def copy(self):

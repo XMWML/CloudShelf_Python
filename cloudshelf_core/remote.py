@@ -162,15 +162,24 @@ class RemoteClient:
             return self._curl(['--url', self.url(posixpath.dirname(old)), '--quote', 'RNFR ' + join(self.base, old), '--quote', 'RNTO ' + join(self.base, new)])
         return self._request('MOVE', old, headers={'Destination': self.url(new), 'Overwrite': 'T'})
 
-    def download(self, item, target):
+    def download(self, item, target, progress=None):
         os.makedirs(os.path.dirname(target), exist_ok=True)
         if self.protocol == 'SFTP':
             return self._sftp_command(['get -p ' + self._quote(item['path']) + ' ' + self._quote(target)])
         if self.protocol == 'FTP':
             self._curl(['--url', self.url(item['path'])], output=target)
             return
-        with open(target, 'wb') as handle:
-            handle.write(self._request('GET', item['path']))
+        request = urllib.request.Request(self.url(item['path']), method='GET')
+        credentials = base64.b64encode(f'{self.profile.get("username", "")}:{self.password}'.encode()).decode()
+        request.add_header('Authorization', 'Basic ' + credentials)
+        with urllib.request.urlopen(request, timeout=60) as response, open(target, 'wb') as handle:
+            total = int(response.headers.get('Content-Length', item.get('size') or 0)) or None
+            completed = 0
+            while True:
+                chunk = response.read(1024 * 128)
+                if not chunk: break
+                handle.write(chunk); completed += len(chunk)
+                if progress: progress(completed, total)
 
     def upload(self, local, directory):
         target = join(directory, os.path.basename(local))
