@@ -23,6 +23,18 @@ SETTINGS_FILE = os.path.join(APP_DIR, 'settings.json')
 class TaskCancelled(Exception):
     pass
 
+
+class TaskControl:
+    def __init__(self):
+        self.cancelled=False; self.paused=False; self._resume=threading.Event(); self._resume.set()
+    def checkpoint(self):
+        if self.cancelled: raise TaskCancelled()
+        self._resume.wait()
+        if self.cancelled: raise TaskCancelled()
+    def toggle_pause(self):
+        self.paused=not self.paused
+        self._resume.set() if not self.paused else self._resume.clear()
+
 def norm(p):
     p = '/' + (p or '').strip().strip('/')
     return posixpath.normpath(p).replace('//', '/')
@@ -227,7 +239,7 @@ class App(TkBase):
         self.files=ttk.Treeview(right,columns=('size','type','modified'),show='tree headings',selectmode='extended'); self.files.heading('#0',text='名称'); self.files.heading('size',text='大小'); self.files.heading('type',text='类型'); self.files.heading('modified',text='修改时间'); self.files.column('#0',width=430); self.files.column('size',width=100); self.files.column('type',width=100); self.files.pack(fill='both',expand=True); self.files.bind('<Double-1>',self.open_item); self.files.bind('<Button-3>',self.context_menu)
         if DND_FILES:
             self.files.drop_target_register(DND_FILES); self.files.dnd_bind('<<Drop>>',self.drop_upload)
-        transfer_head=ttk.Frame(self); transfer_head.pack(fill='x',padx=8); ttk.Label(transfer_head,text='传输任务').pack(side='left'); ttk.Button(transfer_head,text='重试失败',command=self.retry_task).pack(side='right',padx=3); ttk.Button(transfer_head,text='取消任务',command=self.cancel_task).pack(side='right'); self.transfer=ttk.Treeview(self,columns=('state','progress'),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.heading('progress',text='进度'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
+        transfer_head=ttk.Frame(self); transfer_head.pack(fill='x',padx=8); ttk.Label(transfer_head,text='传输任务').pack(side='left'); ttk.Button(transfer_head,text='重试失败',command=self.retry_task).pack(side='right',padx=3); ttk.Button(transfer_head,text='暂停/继续',command=self.pause_task).pack(side='right',padx=3); ttk.Button(transfer_head,text='取消任务',command=self.cancel_task).pack(side='right'); self.transfer=ttk.Treeview(self,columns=('state','progress'),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.heading('progress',text='进度'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
     def refresh_profiles(self):
         self.conn.delete(*self.conn.get_children()); [self.conn.insert('', 'end', iid=str(p['id']), text=p['name'], values=(p['protocol'],)) for p in self.profiles]
     def select_profile(self,_=None):
@@ -307,21 +319,21 @@ class App(TkBase):
         if not self.session:return
         paths=filedialog.askopenfilenames(parent=self,title='选择要上传的文件')
         for p in paths:
-            iid=self.add_transfer(os.path.basename(p),'上传中','0%'); self.jobs[iid]=threading.Event()
+            iid=self.add_transfer(os.path.basename(p),'上传中','0%'); self.jobs[iid]=TaskControl()
             self.retry_jobs[iid]=lambda new_iid,event,p=p:self.upload_path(p,new_iid,event)
             self.worker(lambda p=p,iid=iid:self.upload_path(p,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'上传完成','100%'),iid)
         folder=filedialog.askdirectory(parent=self,title='或选择要上传的文件夹')
         if folder:
-            iid=self.add_transfer(os.path.basename(folder),'上传中','0%'); self.jobs[iid]=threading.Event(); self.worker(lambda iid=iid:self.upload_path(folder,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'文件夹上传完成','100%'),iid)
+            iid=self.add_transfer(os.path.basename(folder),'上传中','0%'); self.jobs[iid]=TaskControl(); self.worker(lambda iid=iid:self.upload_path(folder,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'文件夹上传完成','100%'),iid)
             self.retry_jobs[iid]=lambda new_iid,event,folder=folder:self.upload_path(folder,new_iid,event)
     def drop_upload(self,event):
         if not self.session:return
         for path in self.tk.splitlist(event.data):
-            iid=self.add_transfer(os.path.basename(path),'上传中','0%'); self.jobs[iid]=threading.Event()
+            iid=self.add_transfer(os.path.basename(path),'上传中','0%'); self.jobs[iid]=TaskControl()
             self.retry_jobs[iid]=lambda new_iid,event,path=path:self.upload_path(path,new_iid,event)
             self.worker(lambda path=path,iid=iid:self.upload_path(path,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'上传完成','100%'),iid)
     def upload_path(self,path,iid=None,cancel=None):
-        if cancel and cancel.is_set(): raise TaskCancelled()
+        if cancel: cancel.checkpoint()
         if not os.path.isdir(path):
             result=self.session.upload(path,self.path)
             if iid:self.after(0,lambda:self.update_transfer(iid,'上传中','100%'))
@@ -335,7 +347,7 @@ class App(TkBase):
                 try:self.session.mkdir(join(remote,name))
                 except Exception:pass
             for name in files:
-                if cancel and cancel.is_set(): raise TaskCancelled()
+                if cancel: cancel.checkpoint()
                 self.session.upload(os.path.join(root,name),remote)
                 if iid:self.after(0,lambda name=name:self.update_transfer(iid,'上传中',name))
     def download(self):
@@ -344,9 +356,9 @@ class App(TkBase):
         dest=filedialog.askdirectory(parent=self,title='选择下载目录');
         if dest:
             for x in xs:
-                iid=self.add_transfer(x['name'],'下载中','0%'); self.jobs[iid]=threading.Event(); self.retry_jobs[iid]=lambda new_iid,event,x=x,dest=dest:self.download_path(x,dest,new_iid,event); self.worker(lambda x=x,iid=iid:self.download_path(x,dest,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'下载完成','100%'),iid)
+                iid=self.add_transfer(x['name'],'下载中','0%'); self.jobs[iid]=TaskControl(); self.retry_jobs[iid]=lambda new_iid,event,x=x,dest=dest:self.download_path(x,dest,new_iid,event); self.worker(lambda x=x,iid=iid:self.download_path(x,dest,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'下载完成','100%'),iid)
     def download_path(self,item,dest,iid=None,cancel=None):
-        if cancel and cancel.is_set(): raise TaskCancelled()
+        if cancel: cancel.checkpoint()
         target=os.path.join(dest,item['name'])
         if item['directory']:
             os.makedirs(target,exist_ok=True)
@@ -370,12 +382,17 @@ class App(TkBase):
     def cancel_task(self):
         for iid in self.transfer.selection():
             task=self.jobs.get(iid)
-            if task: task.set(); self.update_transfer(iid,'取消中','-')
+            if task: task.cancelled=True; task._resume.set(); self.update_transfer(iid,'取消中','-')
+    def pause_task(self):
+        for iid in self.transfer.selection():
+            task=self.jobs.get(iid)
+            if task:
+                task.toggle_pause(); self.update_transfer(iid,'已暂停' if task.paused else '继续中','-')
     def retry_task(self):
         for old_iid in self.transfer.selection():
             starter=self.retry_jobs.get(old_iid)
             if not starter: continue
-            title=self.transfer.item(old_iid,'text'); new_iid=self.add_transfer(title,'重试中','0%'); self.jobs[new_iid]=threading.Event(); self.retry_jobs[new_iid]=starter
+            title=self.transfer.item(old_iid,'text'); new_iid=self.add_transfer(title,'重试中','0%'); self.jobs[new_iid]=TaskControl(); self.retry_jobs[new_iid]=starter
             self.worker(lambda new_iid=new_iid:self.retry_jobs[new_iid](new_iid,self.jobs[new_iid]),lambda _,new_iid=new_iid:self.update_transfer(new_iid,'完成','100%'),new_iid)
     def context_menu(self,e):
         iid=self.files.identify_row(e.y)
