@@ -70,8 +70,8 @@ python3 -m unittest discover -s tests -v
 
 ## 已知限制
 
-- 当前传输任务显示状态和同步进度文字，但没有精确进度条和暂停/取消按钮。
-- FTP/SFTP 的部分服务器认证方式依赖系统客户端配置。
+- 当前传输任务显示状态和文件级进度文字，但没有暂停/取消按钮。
+- FTP 操作依赖系统 `curl`，SFTP 操作依赖系统 OpenSSH 客户端。
 - 不提供 Finder、Windows Explorer 或 Linux 文件管理器中的系统级网络挂载。
 
 ## 项目来源

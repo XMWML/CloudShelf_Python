@@ -64,14 +64,14 @@ class RemoteClient:
                     name = parts[8]
                     result.append({'name': name, 'path': join(path, name), 'directory': parts[0].startswith('d'), 'size': int(parts[4]) if parts[4].isdigit() else None, 'modified': '-'})
             return result
-        data = b'<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:resourcetype/><d:getcontentlength/><d:getlastmodified/></d:prop></d:propfind>' if self.protocol == 'WebDAV' else None
+        if self.protocol == 'FTP':
+            return self._parse_unix_listing(self._curl(['--url', self.url(path), '--disable-epsv']), path)
+        data = b'<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname/><d:resourcetype/><d:getcontentlength/><d:getlastmodified/></d:prop></d:propfind>'
         request = urllib.request.Request(self.url(path), method='PROPFIND' if self.protocol == 'WebDAV' else 'GET', headers={'Depth': '1', 'Content-Type': 'application/xml'}, data=data)
         credentials = base64.b64encode(f'{self.profile.get("username", "")}:{self.password}'.encode()).decode()
         request.add_header('Authorization', 'Basic ' + credentials)
         with urllib.request.urlopen(request, timeout=30) as response:
             body = response.read()
-        if self.protocol == 'FTP':
-            return self._parse_unix_listing(body.decode(errors='replace'), path)
         output = []
         for response in ET.fromstring(body).iter():
             if response.tag.split('}')[-1] != 'response':
@@ -104,21 +104,59 @@ class RemoteClient:
         with urllib.request.urlopen(request, timeout=60) as response:
             return response.read()
 
+    def _curl(self, arguments, output=None):
+        config = tempfile.NamedTemporaryFile(mode='w', delete=False)
+        config.write('url = "' + self.url('/').replace('"', '\\"') + '"\n')
+        config.write('user = "' + (self.profile.get('username', '') + ':' + self.password).replace('"', '\\"') + '"\n')
+        config.close()
+        command = ['/usr/bin/curl', '--config', config.name, '--fail', '--silent', '--show-error'] + arguments
+        if output:
+            command += ['--output', output]
+        try:
+            return subprocess.check_output(command, stderr=subprocess.STDOUT, timeout=120).decode(errors='replace')
+        finally:
+            try:
+                os.remove(config.name)
+            except OSError:
+                pass
+
     def mkdir(self, path):
-        return self._sftp_command(['mkdir ' + self._quote(path)]) if self.protocol == 'SFTP' else self._request('MKCOL', path)
+        if self.protocol == 'SFTP':
+            return self._sftp_command(['mkdir ' + self._quote(path)])
+        if self.protocol == 'FTP':
+            return self._curl(['--url', self.url(posixpath.dirname(path)), '--quote', 'MKD ' + join(self.base, path)])
+        return self._request('MKCOL', path)
 
     def delete(self, path):
-        return self._sftp_command(['rm -r ' + self._quote(path)]) if self.protocol == 'SFTP' else self._request('DELETE', path)
+        if self.protocol == 'SFTP':
+            return self._sftp_command(['rm -r ' + self._quote(path)])
+        if self.protocol == 'FTP':
+            try:
+                children = self.list(path)
+            except Exception:
+                children = []
+            for child in children:
+                self.delete(child['path'])
+            try:
+                return self._curl(['--url', self.url(posixpath.dirname(path)), '--quote', 'DELE ' + join(self.base, path)])
+            except subprocess.CalledProcessError:
+                return self._curl(['--url', self.url(posixpath.dirname(path)), '--quote', 'RMD ' + join(self.base, path)])
+        return self._request('DELETE', path)
 
     def rename(self, old, new):
         if self.protocol == 'SFTP':
             return self._sftp_command(['rename ' + self._quote(old) + ' ' + self._quote(new)])
+        if self.protocol == 'FTP':
+            return self._curl(['--url', self.url(posixpath.dirname(old)), '--quote', 'RNFR ' + join(self.base, old), '--quote', 'RNTO ' + join(self.base, new)])
         return self._request('MOVE', old, headers={'Destination': self.url(new), 'Overwrite': 'T'})
 
     def download(self, item, target):
         os.makedirs(os.path.dirname(target), exist_ok=True)
         if self.protocol == 'SFTP':
             return self._sftp_command(['get -p ' + self._quote(item['path']) + ' ' + self._quote(target)])
+        if self.protocol == 'FTP':
+            self._curl(['--url', self.url(item['path'])], output=target)
+            return
         with open(target, 'wb') as handle:
             handle.write(self._request('GET', item['path']))
 
@@ -126,12 +164,19 @@ class RemoteClient:
         target = join(directory, os.path.basename(local))
         if self.protocol == 'SFTP':
             return self._sftp_command(['put -p ' + self._quote(local) + ' ' + self._quote(target)])
+        if self.protocol == 'FTP':
+            return self._curl(['--url', self.url(target), '--upload-file', local])
         with open(local, 'rb') as handle:
             return self._request('PUT', target, handle.read())
 
     def copy(self, item, directory):
         target = join(directory, item['name'])
         if self.protocol == 'SFTP':
+            if item.get('directory'):
+                self.mkdir(target)
+                for child in self.list(item['path']):
+                    self.copy(child, target)
+                return
             return self._sftp_command(['cp ' + self._quote(item['path']) + ' ' + self._quote(target)])
         if self.protocol == 'WebDAV':
             return self._request('COPY', item['path'], headers={'Destination': self.url(target), 'Overwrite': 'T'})
@@ -147,7 +192,9 @@ class RemoteClient:
 
     def move(self, item, directory):
         target = join(directory, item['name'])
-        if self.protocol in ('SFTP', 'WebDAV'):
+        if self.protocol == 'SFTP' and not item.get('directory'):
+            return self.rename(item['path'], target)
+        if self.protocol == 'WebDAV':
             return self.rename(item['path'], target)
         self.copy(item, directory)
         return self.delete(item['path'])

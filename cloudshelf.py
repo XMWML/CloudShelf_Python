@@ -191,7 +191,7 @@ RemoteClient = CoreRemoteClient
 class App(tk.Tk):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True
+        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}
         self.load_profiles(); self.build_ui(); self.refresh_profiles(); self.after(60000,self.auto_sync)
     def load_profiles(self):
         self.profiles=ProfileStore(PROFILE_FILE).load()
@@ -270,7 +270,17 @@ class App(tk.Tk):
     def properties(self):
         xs=self.selected()
         if len(xs)==1:
-            x=xs[0]; messagebox.showinfo('属性',f'名称：{x["name"]}\n类型：{"文件夹" if x["directory"] else "文件"}\n远端路径：{x["path"]}\n大小：{fmt_size(x.get("size"))}\n修改时间：{x.get("modified","-")}',parent=self)
+            x=xs[0]
+            if not x['directory']:
+                messagebox.showinfo('属性',f'名称：{x["name"]}\n类型：文件\n远端路径：{x["path"]}\n大小：{fmt_size(x.get("size"))}\n修改时间：{x.get("modified","-")}',parent=self)
+                return
+            messagebox.showinfo('属性',f'名称：{x["name"]}\n类型：文件夹\n远端路径：{x["path"]}\n大小：正在计算…\n修改时间：{x.get("modified","-")}',parent=self)
+            self.worker(lambda:self.remote_folder_size(x['path']),lambda size:messagebox.showinfo('属性',f'名称：{x["name"]}\n类型：文件夹\n远端路径：{x["path"]}\n大小：{fmt_size(size)}\n修改时间：{x.get("modified","-")}',parent=self))
+    def remote_folder_size(self,path):
+        total=0
+        for item in self.session.list(path):
+            total += self.remote_folder_size(item['path']) if item['directory'] else (item.get('size') or 0)
+        return total
     def upload(self):
         if not self.session:return
         paths=filedialog.askopenfilenames(parent=self,title='选择要上传的文件')
@@ -384,8 +394,25 @@ class App(tk.Tk):
     def auto_sync(self):
         if self.session:
             for rule in self.session.p.get('sync_rules',[]):
-                if rule.get('watch') and rule.get('last_sync',0)+rule.get('interval',15)*60<=time.time(): self.run_rule(rule)
+                if not rule.get('watch'):
+                    continue
+                fingerprint=self.local_fingerprint(rule.get('local',''))
+                previous=self.local_fingerprints.get(rule.get('id'))
+                self.local_fingerprints[rule.get('id')]=fingerprint
+                due=rule.get('last_sync',0)+rule.get('interval',15)*60<=time.time()
+                if (previous is not None and previous != fingerprint) or due: self.run_rule(rule)
         self.after(60000,self.auto_sync)
+    @staticmethod
+    def local_fingerprint(folder):
+        if not folder or not os.path.isdir(folder): return None
+        count=0; total=0; newest=0
+        for root,dirs,files in os.walk(folder):
+            count += len(dirs)+len(files)
+            for name in files:
+                try:
+                    info=os.stat(os.path.join(root,name)); total += info.st_size; newest=max(newest,info.st_mtime)
+                except OSError: pass
+        return count,total,newest
     def profile_dialog(self,old=None):
         w=tk.Toplevel(self); w.title('编辑连接' if old else '新建连接'); w.transient(self); w.grab_set(); vars={}
         fields=[('名称','name'),('协议','protocol'),('服务器地址','host'),('端口','port'),('用户名','username'),('密码','password'),('远端根目录','base_path'),('认证方式','auth'),('私钥路径','private_key'),('主机密钥策略','host_key_policy')]
@@ -401,6 +428,19 @@ class App(tk.Tk):
         def save():
             try: p={k:v.get() for k,v in vars.items()}; p['id']=(old or {}).get('id',str(uuid.uuid4())); p['port']=int(p['port']); p['tls']=p['protocol']=='WebDAV'; p['sync_rules']=(old or {}).get('sync_rules',[])
             except ValueError: messagebox.showerror('输入错误','端口必须是数字',parent=w); return
+            address=p['host'].strip()
+            if not address:
+                messagebox.showerror('输入错误','请填写服务器地址',parent=w); return
+            if '://' in address:
+                parsed=urllib.parse.urlparse(address)
+                expected={'FTP':('ftp','ftps'),'SFTP':('sftp',),'WebDAV':('http','https')}[p['protocol']]
+                if parsed.scheme.lower() not in expected or not parsed.hostname or parsed.query or parsed.fragment or parsed.password is not None:
+                    messagebox.showerror('输入错误','服务器 URL 与所选协议不匹配，且不能包含密码、查询参数或锚点',parent=w); return
+                try: parsed_port=parsed.port
+                except ValueError: messagebox.showerror('输入错误','URL 端口无效',parent=w); return
+                p['host']=parsed.hostname; p['port']=parsed_port or p['port']; p['base_path']=norm(parsed.path or p['base_path']); p['tls']=parsed.scheme.lower() in ('https','ftps')
+            elif '/' in address:
+                messagebox.showerror('输入错误','服务器地址不能包含路径；请填写完整 URL',parent=w); return
             if old:self.profiles=[p if x['id']==old['id'] else x for x in self.profiles]
             else:self.profiles.append(p)
             self.save_profiles(); self.refresh_profiles(); w.destroy()
