@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import concurrent.futures, json, os, posixpath, shutil, subprocess, tempfile, threading, uuid, urllib.parse, urllib.request, urllib.error, time, email.utils
+import concurrent.futures, json, logging, os, posixpath, shutil, subprocess, tempfile, threading, uuid, urllib.parse, urllib.request, urllib.error, time, email.utils
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
@@ -18,6 +18,7 @@ except ImportError:
 APP_DIR = os.path.join(os.path.expanduser('~'), '.cloudshelf')
 PROFILE_FILE = os.path.join(APP_DIR, 'connections.json')
 SETTINGS_FILE = os.path.join(APP_DIR, 'settings.json')
+LOG_FILE = os.path.join(APP_DIR, 'cloudshelf.log')
 
 
 class TaskCancelled(Exception):
@@ -215,22 +216,30 @@ RemoteClient = CoreRemoteClient
 class App(TkBase):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.progress_stats={}; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}; self.sync_scan_busy=False; self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=3)
-        self.protocol('WM_DELETE_WINDOW',self.close_app); self.load_profiles(); self.load_settings(); self.build_ui(); self.refresh_profiles(); self.after(5000,self.auto_sync)
+        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.progress_stats={}; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.max_workers=3; self.local_fingerprints={}; self.sync_scan_busy=False; self.load_profiles(); self.load_settings(); os.makedirs(APP_DIR,exist_ok=True); logging.basicConfig(filename=LOG_FILE,level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s'); self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
+        self.protocol('WM_DELETE_WINDOW',self.close_app); self.build_ui(); self.refresh_profiles(); self.after(5000,self.auto_sync)
     def load_profiles(self):
         self.profiles=ProfileStore(PROFILE_FILE).load()
     def save_profiles(self):
         ProfileStore(PROFILE_FILE).save(self.profiles)
     def load_settings(self):
         try:
-            with open(SETTINGS_FILE, encoding='utf-8') as handle: self.auto_sync_enabled=bool(json.load(handle).get('automatic_sync',True))
+            with open(SETTINGS_FILE, encoding='utf-8') as handle:
+                settings=json.load(handle); self.auto_sync_enabled=bool(settings.get('automatic_sync',True)); self.max_workers=max(1,min(8,int(settings.get('max_workers',3))))
         except (OSError,ValueError,TypeError): self.auto_sync_enabled=True
     def save_settings(self):
         os.makedirs(APP_DIR,exist_ok=True)
-        with open(SETTINGS_FILE,'w',encoding='utf-8') as handle: json.dump({'automatic_sync':self.auto_sync_enabled},handle)
+        with open(SETTINGS_FILE,'w',encoding='utf-8') as handle: json.dump({'automatic_sync':self.auto_sync_enabled,'max_workers':self.max_workers},handle)
+    def settings_dialog(self):
+        w=tk.Toplevel(self); w.title('设置'); w.transient(self); ttk.Label(w,text='传输并发数（下次启动生效）').grid(row=0,column=0,padx=10,pady=10); workers=tk.IntVar(value=self.max_workers); ttk.Spinbox(w,from_=1,to=8,textvariable=workers,width=8).grid(row=0,column=1,padx=10,pady=10)
+        def save():
+            try:self.max_workers=max(1,min(8,workers.get()))
+            except tk.TclError: messagebox.showerror('输入错误','并发数必须是 1 到 8',parent=w); return
+            self.save_settings(); w.destroy()
+        ttk.Button(w,text='保存',command=save).grid(row=1,column=1,sticky='e',padx=10,pady=10)
     def build_ui(self):
         bar=ttk.Frame(self,padding=6); bar.pack(fill='x')
-        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('删除连接',self.delete_profile),('同步管理',self.sync_manager),('自动同步：开/关',self.toggle_auto_sync),('后退',self.go_back),('前进',self.go_forward),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
+        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('删除连接',self.delete_profile),('同步管理',self.sync_manager),('设置',self.settings_dialog),('自动同步：开/关',self.toggle_auto_sync),('后退',self.go_back),('前进',self.go_forward),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
         for sequence,command in [('<Control-c>',self.copy_selection),('<Command-c>',self.copy_selection),('<Control-x>',self.cut_selection),('<Command-x>',self.cut_selection),('<Control-v>',self.paste_selection),('<Command-v>',self.paste_selection),('<Control-i>',self.properties),('<Command-i>',self.properties),('<Control-r>',self.refresh),('<Command-r>',self.refresh)]: self.bind_all(sequence,lambda _,command=command:command())
         pan=ttk.PanedWindow(self,orient='horizontal'); pan.pack(fill='both',expand=True,padx=6,pady=4)
         left=ttk.Frame(pan,width=270); right=ttk.Frame(pan); pan.add(left,weight=1); pan.add(right,weight=4)
@@ -256,7 +265,7 @@ class App(TkBase):
         def run():
             try: result=fn(); self.after(0,lambda: ok(result) if ok else None)
             except TaskCancelled: self.after(0,lambda:self.update_transfer(iid,'已取消','-') if iid else None)
-            except Exception as e: self.after(0,lambda:(self.update_transfer(iid,'失败','-') if iid else None, messagebox.showerror('操作失败',str(e))))
+            except Exception as e: logging.exception('Background task failed'); self.after(0,lambda:(self.update_transfer(iid,'失败','-') if iid else None, messagebox.showerror('操作失败',str(e))))
         self.executor.submit(run)
     def close_app(self):
         self.executor.shutdown(wait=False,cancel_futures=True); self.destroy()
