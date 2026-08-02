@@ -19,6 +19,7 @@ CloudShelf 的跨平台 Python + Tkinter 文件管理器版本。它保留了原
 - 右键文件菜单和传输状态显示
 - macOS/Linux/Windows 启动脚本
 - 仅使用 Python 标准库，不需要安装第三方 Python 包
+- 安装可选的 `tkinterdnd2` 后支持 Finder/Explorer 文件拖拽上传
 
 ## 项目结构
 
@@ -54,6 +55,7 @@ python3 -m unittest discover -s tests -v
 - FTP 和 WebDAV 使用 Python 标准库实现。
 - SFTP 使用系统 OpenSSH `sftp` 客户端。Windows 需要启用或安装 OpenSSH Client。
 - Linux 发行版通常需要单独安装 Tk，例如 Debian/Ubuntu 的 `python3-tk`。
+- 拖拽上传为可选增强：`python3 -m pip install tkinterdnd2`。
 
 ## 连接配置
 
@@ -68,6 +70,12 @@ python3 -m unittest discover -s tests -v
 ## 安全说明
 
 当前版本为了保持跨平台和零依赖，将密码保存在本地连接配置文件中。请确保该文件权限仅当前用户可读，并不要把个人配置文件提交到 Git。后续可以接入 Windows Credential Manager、macOS Keychain 和 Linux Secret Service。
+
+如果安装了可选的 `keyring` 包，连接密码会优先保存到当前系统的凭据存储，配置文件中不再保存密码：
+
+```bash
+python3 -m pip install keyring
+```
 
 ## 已知限制
 

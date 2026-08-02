@@ -3,6 +3,41 @@ import os
 import stat
 import uuid
 
+try:
+    import keyring
+except ImportError:
+    keyring = None
+
+
+class CredentialStore:
+    service = 'CloudShelf'
+
+    @classmethod
+    def available(cls):
+        return keyring is not None
+
+    @classmethod
+    def save(cls, profile_id, password):
+        if keyring is not None and password:
+            keyring.set_password(cls.service, str(profile_id), password)
+
+    @classmethod
+    def load(cls, profile_id):
+        if keyring is None:
+            return None
+        try:
+            return keyring.get_password(cls.service, str(profile_id))
+        except Exception:
+            return None
+
+    @classmethod
+    def delete(cls, profile_id):
+        if keyring is not None:
+            try:
+                keyring.delete_password(cls.service, str(profile_id))
+            except Exception:
+                pass
+
 
 class ProfileStore:
     def __init__(self, path):
@@ -14,13 +49,30 @@ class ProfileStore:
                 profiles = json.load(handle)
         except (OSError, ValueError, TypeError):
             return []
-        return [self.migrate(profile) for profile in profiles if isinstance(profile, dict)]
+        result = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            profile = self.migrate(profile)
+            stored = CredentialStore.load(profile['id'])
+            if stored:
+                profile['password'] = stored
+            result.append(profile)
+        return result
 
     def save(self, profiles):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         temporary = self.path + '.tmp'
+        persisted = []
+        for profile in profiles:
+            entry = dict(profile)
+            password = entry.get('password', '')
+            if CredentialStore.available() and password:
+                CredentialStore.save(entry.get('id'), password)
+                entry.pop('password', None)
+            persisted.append(entry)
         with open(temporary, 'w', encoding='utf-8') as handle:
-            json.dump(profiles, handle, ensure_ascii=False, indent=2)
+            json.dump(persisted, handle, ensure_ascii=False, indent=2)
         os.replace(temporary, self.path)
         try:
             os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)

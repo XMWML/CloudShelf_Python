@@ -8,6 +8,13 @@ from cloudshelf_core.storage import ProfileStore
 from cloudshelf_core.sync import SyncEngine as CoreSyncEngine
 from cloudshelf_core.remote import RemoteClient as CoreRemoteClient
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    TkBase = TkinterDnD.Tk
+except ImportError:
+    DND_FILES = None
+    TkBase = tk.Tk
+
 APP_DIR = os.path.join(os.path.expanduser('~'), '.cloudshelf')
 PROFILE_FILE = os.path.join(APP_DIR, 'connections.json')
 SETTINGS_FILE = os.path.join(APP_DIR, 'settings.json')
@@ -189,7 +196,7 @@ SyncEngine = CoreSyncEngine
 RemoteClient = CoreRemoteClient
 
 
-class App(tk.Tk):
+class App(TkBase):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
         self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.local_fingerprints={}
@@ -208,12 +215,14 @@ class App(tk.Tk):
     def build_ui(self):
         bar=ttk.Frame(self,padding=6); bar.pack(fill='x')
         for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('删除连接',self.delete_profile),('同步管理',self.sync_manager),('自动同步：开/关',self.toggle_auto_sync),('后退',self.go_back),('前进',self.go_forward),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
-        self.bind_all('<Control-c>',lambda _:self.copy_selection()); self.bind_all('<Control-x>',lambda _:self.cut_selection()); self.bind_all('<Control-v>',lambda _:self.paste_selection()); self.bind_all('<Control-i>',lambda _:self.properties()); self.bind_all('<Control-r>',lambda _:self.refresh())
+        for sequence,command in [('<Control-c>',self.copy_selection),('<Command-c>',self.copy_selection),('<Control-x>',self.cut_selection),('<Command-x>',self.cut_selection),('<Control-v>',self.paste_selection),('<Command-v>',self.paste_selection),('<Control-i>',self.properties),('<Command-i>',self.properties),('<Control-r>',self.refresh),('<Command-r>',self.refresh)]: self.bind_all(sequence,lambda _,command=command:command())
         pan=ttk.PanedWindow(self,orient='horizontal'); pan.pack(fill='both',expand=True,padx=6,pady=4)
         left=ttk.Frame(pan,width=270); right=ttk.Frame(pan); pan.add(left,weight=1); pan.add(right,weight=4)
         ttk.Label(left,text='连接').pack(anchor='w'); self.conn=ttk.Treeview(left,columns=('protocol',),show='tree headings',selectmode='browse'); self.conn.heading('#0',text='连接'); self.conn.heading('protocol',text='协议'); self.conn.column('protocol',width=70); self.conn.pack(fill='both',expand=True); self.conn.bind('<<TreeviewSelect>>',self.select_profile); self.conn.bind('<Button-3>',self.connection_menu)
         head=ttk.Frame(right); head.pack(fill='x'); self.status=tk.StringVar(value='未选择连接'); ttk.Label(head,textvariable=self.status).pack(side='left'); self.path_var=tk.StringVar(value='/'); ttk.Label(head,textvariable=self.path_var).pack(side='right')
         self.files=ttk.Treeview(right,columns=('size','type','modified'),show='tree headings',selectmode='extended'); self.files.heading('#0',text='名称'); self.files.heading('size',text='大小'); self.files.heading('type',text='类型'); self.files.heading('modified',text='修改时间'); self.files.column('#0',width=430); self.files.column('size',width=100); self.files.column('type',width=100); self.files.pack(fill='both',expand=True); self.files.bind('<Double-1>',self.open_item); self.files.bind('<Button-3>',self.context_menu)
+        if DND_FILES:
+            self.files.drop_target_register(DND_FILES); self.files.dnd_bind('<<Drop>>',self.drop_upload)
         ttk.Label(self,text='传输任务').pack(anchor='w',padx=8); self.transfer=ttk.Treeview(self,columns=('state','progress'),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.heading('progress',text='进度'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
     def refresh_profiles(self):
         self.conn.delete(*self.conn.get_children()); [self.conn.insert('', 'end', iid=str(p['id']), text=p['name'], values=(p['protocol'],)) for p in self.profiles]
@@ -298,6 +307,11 @@ class App(tk.Tk):
         folder=filedialog.askdirectory(parent=self,title='或选择要上传的文件夹')
         if folder:
             iid=self.add_transfer(os.path.basename(folder),'上传中','0%'); self.worker(lambda iid=iid:self.upload_path(folder,iid),lambda _,iid=iid:self.update_transfer(iid,'文件夹上传完成','100%'))
+    def drop_upload(self,event):
+        if not self.session:return
+        for path in self.tk.splitlist(event.data):
+            iid=self.add_transfer(os.path.basename(path),'上传中','0%')
+            self.worker(lambda path=path,iid=iid:self.upload_path(path,iid),lambda _,iid=iid:self.update_transfer(iid,'上传完成','100%'))
     def upload_path(self,path,iid=None):
         if not os.path.isdir(path):
             result=self.session.upload(path,self.path)
@@ -383,7 +397,12 @@ class App(tk.Tk):
     def rule_dialog(self,rules,old,reload):
         w=tk.Toplevel(self); w.title('编辑同步规则' if old else '添加同步规则'); vars={}
         fields=[('本地文件夹','local'),('远端文件夹','remote')]
-        for row,(label,key) in enumerate(fields): ttk.Label(w,text=label).grid(row=row,column=0,padx=8,pady=6); v=tk.StringVar(value=(old or {}).get(key,'/' if key=='remote' else '')); vars[key]=v; ttk.Entry(w,textvariable=v,width=48).grid(row=row,column=1,padx=8,pady=6)
+        for row,(label,key) in enumerate(fields):
+            ttk.Label(w,text=label).grid(row=row,column=0,padx=8,pady=6)
+            v=tk.StringVar(value=(old or {}).get(key,'/' if key=='remote' else '')); vars[key]=v
+            frame=ttk.Frame(w); frame.grid(row=row,column=1,padx=8,pady=6,sticky='ew'); ttk.Entry(frame,textvariable=v,width=38).pack(side='left',fill='x',expand=True)
+            if key=='local': ttk.Button(frame,text='浏览…',command=lambda v=v:self.choose_local_folder(v)).pack(side='left',padx=4)
+            else: ttk.Button(frame,text='选择…',command=lambda v=v:self.choose_remote_folder(v)).pack(side='left',padx=4)
         checks=[]
         for row,(label,key,default) in enumerate([('本地新增/修改上传','upload',True),('远端新增/修改下载','download',False),('本地删除同步到远端','delete_remote',False),('远端删除同步到本地','delete_local',False),('检测本地变化自动同步','watch',False)],2):
             v=tk.BooleanVar(value=(old or {}).get(key,default)); checks.append((key,v)); ttk.Checkbutton(w,text=label,variable=v).grid(row=row,column=1,sticky='w',padx=8,pady=3)
@@ -394,6 +413,22 @@ class App(tk.Tk):
             if not old: rules.append(r)
             self.save_profiles(); w.destroy(); reload()
         ttk.Button(w,text='保存',command=save).grid(row=9,column=1,sticky='e',padx=8,pady=10)
+    def choose_local_folder(self,variable):
+        path=filedialog.askdirectory(parent=self,title='选择本地同步文件夹')
+        if path: variable.set(path)
+    def choose_remote_folder(self,variable):
+        if not self.session:return
+        w=tk.Toplevel(self); w.title('选择远端文件夹'); w.geometry('520x400'); tree=ttk.Treeview(w,columns=('path',),show='tree headings'); tree.heading('#0',text='名称'); tree.heading('path',text='路径'); tree.pack(fill='both',expand=True,padx=8,pady=8)
+        current=norm(variable.get() or '/'); tree.insert('', 'end',iid='__root__',text='/',values=('/',)); tree.selection_set('__root__')
+        def load(parent,path):
+            self.worker(lambda:self.session.list(path),lambda items: [tree.insert(parent,'end',text='📁 '+x['name'],values=(x['path'],)) for x in items if x['directory']])
+        load('__root__',current)
+        def choose():
+            selected=tree.selection()
+            if selected:
+                variable.set(tree.item(selected[0],'values')[0]); w.destroy()
+        tree.bind('<Double-1>',lambda _: load(tree.selection()[0],tree.item(tree.selection()[0],'values')[0]) if tree.selection() else None)
+        ttk.Button(w,text='选择',command=choose).pack(anchor='e',padx=8,pady=8)
     def run_rule(self,rule,reload=lambda:None):
         if not rule.get('enabled',True): return
         def job():
@@ -432,7 +467,9 @@ class App(tk.Tk):
             elif key == 'auth': ent=ttk.Combobox(w,textvariable=v,values=('password','ssh_agent','private_key'),state='readonly')
             elif key == 'host_key_policy': ent=ttk.Combobox(w,textvariable=v,values=('accept-new','strict'),state='readonly')
             else: ent=ttk.Entry(w,textvariable=v,show='*' if key=='password' else '')
-            ent.grid(row=r,column=1,padx=10,pady=5)
+            if key=='private_key':
+                frame=ttk.Frame(w); frame.grid(row=r,column=1,padx=10,pady=5,sticky='ew'); ent.pack(in_=frame,side='left',fill='x',expand=True); ttk.Button(frame,text='浏览…',command=lambda v=v:self.choose_private_key(v)).pack(side='left',padx=4)
+            else: ent.grid(row=r,column=1,padx=10,pady=5)
         def save():
             try: p={k:v.get() for k,v in vars.items()}; p['id']=(old or {}).get('id',str(uuid.uuid4())); p['port']=int(p['port']); p['tls']=p['protocol']=='WebDAV'; p['sync_rules']=(old or {}).get('sync_rules',[])
             except ValueError: messagebox.showerror('输入错误','端口必须是数字',parent=w); return
@@ -453,5 +490,8 @@ class App(tk.Tk):
             else:self.profiles.append(p)
             self.save_profiles(); self.refresh_profiles(); w.destroy()
         ttk.Button(w,text='保存',command=save).grid(row=len(fields),column=1,sticky='e',padx=10,pady=10)
+    def choose_private_key(self,variable):
+        path=filedialog.askopenfilename(parent=self,title='选择 SSH 私钥文件')
+        if path: variable.set(path)
 
 if __name__=='__main__': App().mainloop()
