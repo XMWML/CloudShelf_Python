@@ -7,6 +7,7 @@ from cloudshelf_core.paths import join, norm
 from cloudshelf_core.storage import ProfileStore
 from cloudshelf_core.sync import SyncEngine
 from cloudshelf_core.remote import RemoteClient
+from cloudshelf_core.settings import normalized_settings
 
 
 class FakeClient:
@@ -61,6 +62,12 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(ftps.p['host'], 'files.example.com')
         self.assertEqual(ftps.p['base_path'], '/backups')
         self.assertTrue(ftps.url('/').startswith('ftps://files.example.com:990/'))
+
+    def test_settings_have_portable_safe_bounds(self):
+        settings = normalized_settings({'max_workers': 99, 'preview_max_bytes': 0, 'language': 'unsupported'})
+        self.assertEqual(settings['max_workers'], 8)
+        self.assertEqual(settings['preview_max_bytes'], 1)
+        self.assertEqual(settings['language'], 'system')
 
     def test_ftp_folder_copy_is_recursive(self):
         client = RemoteClient({'host': 'example.com', 'port': 21, 'protocol': 'FTP'})

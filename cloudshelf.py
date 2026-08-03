@@ -7,6 +7,7 @@ from cloudshelf_core.paths import fmt_size as core_fmt_size, join as core_join, 
 from cloudshelf_core.storage import CredentialStore, ProfileStore
 from cloudshelf_core.sync import SyncEngine as CoreSyncEngine
 from cloudshelf_core.remote import RemoteClient as CoreRemoteClient
+from cloudshelf_core.settings import normalized_settings
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -19,7 +20,7 @@ APP_DIR = os.path.join(os.path.expanduser('~'), '.cloudshelf')
 PROFILE_FILE = os.path.join(APP_DIR, 'connections.json')
 SETTINGS_FILE = os.path.join(APP_DIR, 'settings.json')
 LOG_FILE = os.path.join(APP_DIR, 'cloudshelf.log')
-
+PREVIEW_DIR = os.path.join(APP_DIR, 'preview')
 
 class TaskCancelled(Exception):
     pass
@@ -216,8 +217,8 @@ RemoteClient = CoreRemoteClient
 class App(TkBase):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.progress_stats={}; self.active_sync_rules=set(); self.clipboard=[]; self.clipboard_mode='copy'; self.auto_sync_enabled=True; self.max_workers=3; self.local_fingerprints={}; self.sync_scan_busy=False; self.load_profiles(); self.load_settings(); os.makedirs(APP_DIR,exist_ok=True); logging.basicConfig(filename=LOG_FILE,level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s'); self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
-        self.protocol('WM_DELETE_WINDOW',self.close_app); self.build_ui(); self.refresh_profiles(); self.after(5000,self.auto_sync)
+        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.progress_stats={}; self.active_sync_rules=set(); self.clipboard=[]; self.clipboard_mode='copy'; self.checked_items=set(); self.connection_states={}; self.local_fingerprints={}; self.sync_scan_busy=False; self.load_profiles(); self.load_settings(); os.makedirs(PREVIEW_DIR,exist_ok=True); logging.basicConfig(filename=LOG_FILE,level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s'); self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=self.settings['max_workers'])
+        self.language=self.settings['language']; self.protocol('WM_DELETE_WINDOW',self.close_app); self.build_ui(); self.localize_widgets(); self.refresh_profiles(); self.after(5000,self.auto_sync)
     def load_profiles(self):
         self.profiles=ProfileStore(PROFILE_FILE).load()
     def save_profiles(self):
@@ -225,42 +226,86 @@ class App(TkBase):
     def load_settings(self):
         try:
             with open(SETTINGS_FILE, encoding='utf-8') as handle:
-                settings=json.load(handle); self.auto_sync_enabled=bool(settings.get('automatic_sync',True)); self.max_workers=max(1,min(8,int(settings.get('max_workers',3))))
-        except (OSError,ValueError,TypeError): self.auto_sync_enabled=True
+                self.settings=normalized_settings(json.load(handle))
+        except (OSError,ValueError,TypeError): self.settings=normalized_settings({})
+        self.auto_sync_enabled=self.settings['automatic_sync']; self.max_workers=self.settings['max_workers']
     def save_settings(self):
         os.makedirs(APP_DIR,exist_ok=True)
-        with open(SETTINGS_FILE,'w',encoding='utf-8') as handle: json.dump({'automatic_sync':self.auto_sync_enabled,'max_workers':self.max_workers},handle)
+        self.settings['automatic_sync']=self.auto_sync_enabled; self.settings['max_workers']=self.max_workers
+        temporary=SETTINGS_FILE + '.tmp'
+        with open(temporary,'w',encoding='utf-8') as handle: json.dump(self.settings,handle,ensure_ascii=False,indent=2)
+        os.replace(temporary,SETTINGS_FILE)
+    def translate(self, value):
+        if self.language != 'en': return value
+        return {
+            '新建连接':'New Connection', '编辑连接':'Edit Connection', '删除连接':'Delete Connection', '连接/断开':'Connect/Disconnect',
+            '同步管理':'Sync Manager', '设置':'Settings', '自动同步：开/关':'Auto Sync: On/Off', '后退':'Back', '前进':'Forward',
+            '上级目录':'Up', '刷新':'Refresh', '新建文件夹':'New Folder', '上传':'Upload', '下载':'Download', '复制到':'Copy To',
+            '移动到':'Move To', '重命名':'Rename', '删除':'Delete', '连接':'Connections', '协议':'Protocol', '状态':'Status',
+            '名称':'Name', '选择':'Select', '大小':'Size', '类型':'Type', '修改时间':'Modified', '文本预览':'Text Preview',
+            '传输任务':'Transfers', '清除已结束':'Clear Finished', '全部开始':'Start All', '全部停止':'Pause All', '重试失败':'Retry Failed',
+            '暂停/继续':'Pause/Resume', '取消任务':'Cancel Task', '项目':'Item', '文件夹':'Folder', '文件':'File'
+        }.get(value,value)
+    def localize_widgets(self, parent=None):
+        parent=parent or self
+        for child in parent.winfo_children():
+            try:
+                text=child.cget('text')
+                if text: child.configure(text=self.translate(text))
+            except tk.TclError: pass
+            self.localize_widgets(child)
     def settings_dialog(self):
-        w=tk.Toplevel(self); w.title('设置'); w.transient(self); ttk.Label(w,text='传输并发数（下次启动生效）').grid(row=0,column=0,padx=10,pady=10); workers=tk.IntVar(value=self.max_workers); ttk.Spinbox(w,from_=1,to=8,textvariable=workers,width=8).grid(row=0,column=1,padx=10,pady=10)
+        w=tk.Toplevel(self); w.title('Settings'); w.transient(self); w.grab_set(); tabs=ttk.Notebook(w); tabs.pack(fill='both',expand=True,padx=10,pady=10)
+        preview=ttk.Frame(tabs,padding=8); transfer=ttk.Frame(tabs,padding=8); sync=ttk.Frame(tabs,padding=8); tabs.add(preview,text='Preview'); tabs.add(transfer,text='Transfers'); tabs.add(sync,text='Sync')
+        enabled=tk.BooleanVar(value=self.settings['preview_enabled']); extensions=tk.StringVar(value=self.settings['preview_extensions']); maximum=tk.IntVar(value=self.settings['preview_max_bytes']//1024); language=tk.StringVar(value=self.settings['language'])
+        ttk.Checkbutton(preview,text='Enable text preview',variable=enabled).grid(row=0,column=0,columnspan=2,sticky='w',pady=4)
+        ttk.Label(preview,text='Text extensions').grid(row=1,column=0,sticky='w',pady=4); ttk.Entry(preview,textvariable=extensions,width=46).grid(row=1,column=1,sticky='ew',pady=4)
+        ttk.Label(preview,text='Maximum preview size (KB)').grid(row=2,column=0,sticky='w',pady=4); ttk.Spinbox(preview,from_=1,to=102400,textvariable=maximum,width=10).grid(row=2,column=1,sticky='w',pady=4)
+        ttk.Label(preview,text='Language').grid(row=3,column=0,sticky='w',pady=4); ttk.Combobox(preview,textvariable=language,values=('system','zh','en'),state='readonly',width=12).grid(row=3,column=1,sticky='w',pady=4)
+        workers=tk.IntVar(value=self.max_workers); download_dir=tk.StringVar(value=self.settings['download_directory']); ask_destination=tk.BooleanVar(value=self.settings['ask_download_destination'])
+        ttk.Label(transfer,text='Concurrent tasks').grid(row=0,column=0,sticky='w',pady=4); ttk.Spinbox(transfer,from_=1,to=8,textvariable=workers,width=8).grid(row=0,column=1,sticky='w',pady=4)
+        ttk.Checkbutton(transfer,text='Ask for a destination on every download',variable=ask_destination).grid(row=1,column=0,columnspan=2,sticky='w',pady=4)
+        ttk.Label(transfer,text='Default download directory').grid(row=2,column=0,sticky='w',pady=4); ttk.Entry(transfer,textvariable=download_dir,width=42).grid(row=2,column=1,sticky='ew',pady=4)
+        ttk.Label(sync,text='Manage rules for the selected connection.').pack(anchor='w',pady=4); ttk.Button(sync,text='Open Sync Manager',command=self.sync_manager).pack(anchor='w')
         def save():
-            try:self.max_workers=max(1,min(8,workers.get()))
-            except tk.TclError: messagebox.showerror('输入错误','并发数必须是 1 到 8',parent=w); return
+            try:
+                self.max_workers=max(1,min(8,workers.get())); self.settings.update({'preview_enabled':enabled.get(),'preview_extensions':extensions.get(),'preview_max_bytes':maximum.get()*1024,'language':language.get(),'download_directory':download_dir.get().strip(),'ask_download_destination':ask_destination.get()}); self.language=language.get()
+            except tk.TclError: messagebox.showerror('Invalid settings','Task count and preview size must be numbers.',parent=w); return
             self.save_settings(); w.destroy()
-        ttk.Button(w,text='保存',command=save).grid(row=1,column=1,sticky='e',padx=10,pady=10)
+        ttk.Button(w,text='Save',command=save).pack(anchor='e',padx=10,pady=(0,10))
     def build_ui(self):
         bar=ttk.Frame(self,padding=6); bar.pack(fill='x')
-        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('删除连接',self.delete_profile),('同步管理',self.sync_manager),('设置',self.settings_dialog),('自动同步：开/关',self.toggle_auto_sync),('后退',self.go_back),('前进',self.go_forward),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
-        for sequence,command in [('<Control-c>',self.copy_selection),('<Command-c>',self.copy_selection),('<Control-x>',self.cut_selection),('<Command-x>',self.cut_selection),('<Control-v>',self.paste_selection),('<Command-v>',self.paste_selection),('<Control-i>',self.properties),('<Command-i>',self.properties),('<Control-r>',self.refresh),('<Command-r>',self.refresh)]: self.bind_all(sequence,lambda _,command=command:command())
+        for text,cmd in [('新建连接',self.add_profile),('编辑连接',self.edit_profile),('删除连接',self.delete_profile),('连接/断开',self.toggle_connection),('同步管理',self.sync_manager),('设置',self.settings_dialog),('自动同步：开/关',self.toggle_auto_sync),('后退',self.go_back),('前进',self.go_forward),('上级目录',self.go_up),('刷新',self.refresh),('新建文件夹',self.mkdir),('上传',self.upload),('下载',self.download),('复制到',self.copy),('移动到',self.move),('重命名',self.rename),('删除',self.delete)]: ttk.Button(bar,text=text,command=cmd).pack(side='left',padx=2)
+        for sequence,command in [('<Control-a>',self.toggle_select_all),('<Command-a>',self.toggle_select_all),('<Control-c>',self.copy_selection),('<Command-c>',self.copy_selection),('<Control-x>',self.cut_selection),('<Command-x>',self.cut_selection),('<Control-v>',self.paste_selection),('<Command-v>',self.paste_selection),('<Control-i>',self.properties),('<Command-i>',self.properties),('<Control-r>',self.refresh),('<Command-r>',self.refresh)]: self.bind_all(sequence,lambda _,command=command:(command(),'break')[1])
         pan=ttk.PanedWindow(self,orient='horizontal'); pan.pack(fill='both',expand=True,padx=6,pady=4)
         left=ttk.Frame(pan,width=270); right=ttk.Frame(pan); pan.add(left,weight=1); pan.add(right,weight=4)
-        ttk.Label(left,text='连接').pack(anchor='w'); self.conn=ttk.Treeview(left,columns=('protocol',),show='tree headings',selectmode='browse'); self.conn.heading('#0',text='连接'); self.conn.heading('protocol',text='协议'); self.conn.column('protocol',width=70); self.conn.pack(fill='both',expand=True); self.conn.bind('<<TreeviewSelect>>',self.select_profile); self.conn.bind('<Button-3>',self.connection_menu)
+        ttk.Label(left,text='连接').pack(anchor='w'); self.conn=ttk.Treeview(left,columns=('protocol','state'),show='tree headings',selectmode='browse'); self.conn.heading('#0',text='连接'); self.conn.heading('protocol',text='协议'); self.conn.heading('state',text='状态'); self.conn.column('protocol',width=70); self.conn.column('state',width=70); self.conn.pack(fill='both',expand=True); self.conn.bind('<<TreeviewSelect>>',self.select_profile); self.conn.bind('<Button-3>',self.connection_menu)
         head=ttk.Frame(right); head.pack(fill='x'); self.status=tk.StringVar(value='未选择连接'); ttk.Label(head,textvariable=self.status).pack(side='left'); self.path_var=tk.StringVar(value='/'); ttk.Label(head,textvariable=self.path_var).pack(side='right')
-        self.files=ttk.Treeview(right,columns=('size','type','modified'),show='tree headings',selectmode='extended'); self.files.heading('#0',text='名称'); self.files.heading('size',text='大小'); self.files.heading('type',text='类型'); self.files.heading('modified',text='修改时间'); self.files.column('#0',width=430); self.files.column('size',width=100); self.files.column('type',width=100); self.files.pack(fill='both',expand=True); self.files.bind('<Double-1>',self.open_item); self.files.bind('<Button-3>',self.context_menu)
+        self.files=ttk.Treeview(right,columns=('checked','size','type','modified'),show='tree headings',selectmode='extended'); self.files.heading('#0',text='名称'); self.files.heading('checked',text='选择'); self.files.heading('size',text='大小'); self.files.heading('type',text='类型'); self.files.heading('modified',text='修改时间'); self.files.column('#0',width=390); self.files.column('checked',width=52,anchor='center'); self.files.column('size',width=100); self.files.column('type',width=100); self.files.pack(fill='both',expand=True); self.files.bind('<Double-1>',self.open_item); self.files.bind('<Button-3>',self.context_menu); self.files.bind('<Button-1>',self.file_click); self.files.bind('<<TreeviewSelect>>',self.preview_selected)
         if DND_FILES:
             self.files.drop_target_register(DND_FILES); self.files.dnd_bind('<<Drop>>',self.drop_upload)
-        transfer_head=ttk.Frame(self); transfer_head.pack(fill='x',padx=8); ttk.Label(transfer_head,text='传输任务').pack(side='left'); ttk.Button(transfer_head,text='重试失败',command=self.retry_task).pack(side='right',padx=3); ttk.Button(transfer_head,text='暂停/继续',command=self.pause_task).pack(side='right',padx=3); ttk.Button(transfer_head,text='取消任务',command=self.cancel_task).pack(side='right'); self.transfer=ttk.Treeview(self,columns=('state','progress'),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.heading('progress',text='进度'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
+        self.preview_frame=ttk.LabelFrame(right,text='文本预览'); self.preview_text=tk.Text(self.preview_frame,height=9,wrap='word',state='disabled'); self.preview_text.pack(fill='both',expand=True,padx=4,pady=4); self.preview_frame.pack(fill='x',pady=(5,0))
+        transfer_head=ttk.Frame(self); transfer_head.pack(fill='x',padx=8); ttk.Label(transfer_head,text='传输任务').pack(side='left'); ttk.Button(transfer_head,text='清除已结束',command=self.clear_finished_transfers).pack(side='right',padx=3); ttk.Button(transfer_head,text='全部开始',command=self.start_all_transfers).pack(side='right',padx=3); ttk.Button(transfer_head,text='全部停止',command=self.pause_all_transfers).pack(side='right',padx=3); ttk.Button(transfer_head,text='重试失败',command=self.retry_failed_transfers).pack(side='right',padx=3); ttk.Button(transfer_head,text='暂停/继续',command=self.pause_task).pack(side='right',padx=3); ttk.Button(transfer_head,text='取消任务',command=self.cancel_task).pack(side='right'); self.transfer=ttk.Treeview(self,columns=('state','progress'),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.heading('progress',text='进度'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
     def refresh_profiles(self):
-        self.conn.delete(*self.conn.get_children()); [self.conn.insert('', 'end', iid=str(p['id']), text=p['name'], values=(p['protocol'],)) for p in self.profiles]
+        self.conn.delete(*self.conn.get_children()); [self.conn.insert('', 'end', iid=str(p['id']), text=p['name'], values=(p['protocol'],self.connection_states.get(str(p['id']),'未连接'))) for p in self.profiles]
     def select_profile(self,_=None):
         sel=self.conn.selection();
         if not sel:return
-        self.session=RemoteClient(next(p for p in self.profiles if str(p['id'])==sel[0])); self.path='/'; self.history=['/']; self.history_index=0; self.status.set(f'{self.session.p["name"]}  |  {self.session.p["protocol"]}  |  已连接'); self.refresh()
+        profile=next(p for p in self.profiles if str(p['id'])==sel[0]); self.connection_states[sel[0]]='连接中'; self.conn.item(sel[0],values=(profile['protocol'],'连接中'))
+        self.session=RemoteClient(profile); self.path='/'; self.history=['/']; self.history_index=0; self.status.set(f'{self.session.p["name"]}  |  {self.session.p["protocol"]}  |  已连接'); self.connection_states[sel[0]]='已连接'; self.conn.item(sel[0],values=(profile['protocol'],'已连接')); self.refresh()
+    def toggle_connection(self):
+        selected=self.conn.selection()
+        if not selected: return
+        identifier=selected[0]
+        if self.session and str(self.session.p.get('id')) == identifier:
+            self.session=None; self.items=[]; self.checked_items.clear(); self.files.delete(*self.files.get_children()); self.status.set('已断开连接'); self.connection_states[identifier]='未连接'; profile=next(p for p in self.profiles if str(p['id'])==identifier); self.conn.item(identifier,values=(profile['protocol'],'未连接')); return
+        self.select_profile()
     def toggle_auto_sync(self):
         self.auto_sync_enabled=not self.auto_sync_enabled; self.save_settings(); messagebox.showinfo('自动同步', '已启用' if self.auto_sync_enabled else '已停用', parent=self)
     def connection_menu(self,event):
         iid=self.conn.identify_row(event.y)
         if iid:self.conn.selection_set(iid)
-        menu=tk.Menu(self,tearoff=0); menu.add_command(label='连接',command=self.select_profile); menu.add_command(label='编辑',command=self.edit_profile); menu.add_command(label='删除',command=self.delete_profile); menu.post(event.x_root,event.y_root)
+        menu=tk.Menu(self,tearoff=0); menu.add_command(label='连接/断开',command=self.toggle_connection); menu.add_command(label='编辑',command=self.edit_profile); menu.add_command(label='删除',command=self.delete_profile); menu.post(event.x_root,event.y_root)
     def worker(self, fn, ok=None, iid=None):
         def run():
             try: result=fn(); self.after(0,lambda: ok(result) if ok else None)
@@ -273,9 +318,9 @@ class App(TkBase):
         if not self.session:return
         self.worker(lambda:self.session.list(self.path),self.show_items)
     def show_items(self,items):
-        self.items=items; self.files.delete(*self.files.get_children());
-        if self.path!='/': self.files.insert('',0,iid='__up__',text='..',values=('-','上级目录','-'))
-        for i,x in enumerate(items): self.files.insert('', 'end', iid=str(i), text=('📁 ' if x['directory'] else '📄 ')+x['name'],values=(fmt_size(x['size']), '文件夹' if x['directory'] else '文件',x['modified']))
+        self.items=items; self.checked_items.clear(); self.files.delete(*self.files.get_children());
+        if self.path!='/': self.files.insert('',0,iid='__up__',text='..',values=('', '-', '上级目录','-'))
+        for i,x in enumerate(items): self.files.insert('', 'end', iid=str(i), text=('📁 ' if x['directory'] else '📄 ')+x['name'],values=('☐',fmt_size(x['size']), '文件夹' if x['directory'] else '文件',x['modified']))
         self.path_var.set(self.path)
     def open_item(self,_=None):
         sel=self.files.selection();
@@ -292,7 +337,21 @@ class App(TkBase):
         if self.history_index+1<len(self.history):self.history_index+=1; self.path=self.history[self.history_index]; self.refresh()
     def go_up(self):
         if self.session and self.path!='/': self.open_path(posixpath.dirname(self.path) or '/')
-    def selected(self): return [self.items[int(i)] for i in self.files.selection() if i!='__up__']
+    def file_click(self,event):
+        identifier=self.files.identify_row(event.y)
+        if identifier and identifier != '__up__' and self.files.identify_column(event.x) == '#1':
+            if identifier in self.checked_items: self.checked_items.remove(identifier)
+            else: self.checked_items.add(identifier)
+            values=list(self.files.item(identifier,'values')); values[0]='☑' if identifier in self.checked_items else '☐'; self.files.item(identifier,values=values)
+            return 'break'
+    def toggle_select_all(self):
+        identifiers={str(index) for index in range(len(self.items))}
+        self.checked_items=set() if self.checked_items == identifiers else identifiers
+        for identifier in identifiers:
+            values=list(self.files.item(identifier,'values')); values[0]='☑' if identifier in self.checked_items else '☐'; self.files.item(identifier,values=values)
+    def selected(self):
+        identifiers=self.checked_items or {item for item in self.files.selection() if item!='__up__'}
+        return [self.items[int(identifier)] for identifier in identifiers]
     def mkdir(self):
         if not self.session:return
         name=simpledialog.askstring('新建文件夹','文件夹名称：',parent=self); 
@@ -364,7 +423,8 @@ class App(TkBase):
     def download(self):
         xs=self.selected();
         if not self.session or not xs:return
-        dest=filedialog.askdirectory(parent=self,title='选择下载目录');
+        configured=self.settings.get('download_directory','')
+        dest=filedialog.askdirectory(parent=self,title='选择下载目录',initialdir=configured or None) if self.settings.get('ask_download_destination',True) or not configured else configured
         if dest:
             for x in xs:
                 iid=self.add_transfer(x['name'],'下载中','0%'); self.jobs[iid]=TaskControl(); self.retry_jobs[iid]=lambda new_iid,event,x=x,dest=dest:self.download_path(x,dest,new_iid,event); self.worker(lambda x=x,iid=iid:self.download_path(x,dest,iid,self.jobs[iid]),lambda _,iid=iid:self.update_transfer(iid,'下载完成','100%'),iid)
@@ -413,6 +473,43 @@ class App(TkBase):
             if not starter: continue
             title=self.transfer.item(old_iid,'text'); new_iid=self.add_transfer(title,'重试中','0%'); self.jobs[new_iid]=TaskControl(); self.retry_jobs[new_iid]=starter
             self.worker(lambda new_iid=new_iid:self.retry_jobs[new_iid](new_iid,self.jobs[new_iid]),lambda _,new_iid=new_iid:self.update_transfer(new_iid,'完成','100%'),new_iid)
+    def pause_all_transfers(self):
+        self.transfer.selection_set(self.transfer.get_children()); self.pause_task()
+    def start_all_transfers(self):
+        for identifier, task in self.jobs.items():
+            if task.paused: task.toggle_pause(); self.update_transfer(identifier,'继续中','-')
+    def retry_failed_transfers(self):
+        failed=[identifier for identifier in self.transfer.get_children() if self.transfer.item(identifier,'values')[0] == '失败']
+        self.transfer.selection_set(failed); self.retry_task()
+    def clear_finished_transfers(self):
+        for identifier in self.transfer.get_children():
+            if self.transfer.item(identifier,'values')[0] in ('完成','上传完成','下载完成','文件夹上传完成','已取消','失败'):
+                self.transfer.delete(identifier); self.jobs.pop(identifier,None); self.retry_jobs.pop(identifier,None); self.progress_stats.pop(identifier,None)
+    def preview_selected(self,_=None):
+        if not self.settings.get('preview_enabled',True): return
+        selected=self.selected()
+        if len(selected) != 1 or selected[0]['directory']:
+            self.set_preview('选择一个文本文件以预览。'); return
+        item=selected[0]
+        suffix=os.path.splitext(item['name'])[1].lower().lstrip('.')
+        allowed={part.strip().lstrip('.').lower() for part in self.settings.get('preview_extensions','').split(',') if part.strip()}
+        if suffix not in allowed:
+            self.set_preview('此文件类型未启用文本预览。'); return
+        if item.get('size') is not None and item['size'] > self.settings['preview_max_bytes']:
+            self.set_preview('文件超过预览大小限制。'); return
+        target=os.path.join(PREVIEW_DIR,str(uuid.uuid4())+'-'+os.path.basename(item['name']))
+        self.set_preview('正在下载预览…')
+        self.worker(lambda:self.session.download(item,target),lambda _:self.show_preview_file(target))
+    def show_preview_file(self,path):
+        try:
+            with open(path,'rb') as handle: data=handle.read(self.settings['preview_max_bytes']+1)
+            self.set_preview(data.decode('utf-8',errors='replace'))
+        except OSError as error: self.set_preview('无法加载预览：'+str(error))
+        finally:
+            try: os.remove(path)
+            except OSError: pass
+    def set_preview(self,text):
+        self.preview_text.configure(state='normal'); self.preview_text.delete('1.0','end'); self.preview_text.insert('1.0',text); self.preview_text.configure(state='disabled')
     def context_menu(self,e):
         iid=self.files.identify_row(e.y)
         if iid and iid!='__up__': self.files.selection_set(iid)
