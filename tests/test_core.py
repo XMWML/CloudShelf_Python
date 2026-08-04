@@ -69,6 +69,10 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(settings['preview_max_bytes'], 1)
         self.assertEqual(settings['language'], 'system')
 
+    def test_settings_keep_automatic_connect_profile_id(self):
+        settings = normalized_settings({'automatic_connect_profile_id': 42})
+        self.assertEqual(settings['automatic_connect_profile_id'], '42')
+
     def test_ftp_folder_copy_is_recursive(self):
         client = RemoteClient({'host': 'example.com', 'port': 21, 'protocol': 'FTP'})
         items = {

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0 - 2026-08-04
+
+### Added
+
+- Added a portable loading indicator for remote folder reads and file-preview downloads.
+- Added a Transfers setting that connects one saved server automatically at launch.
+- Restricted task cancellation to paused tasks, matching the transfer queue workflow.
+
 ## 1.1.0 - 2026-08-03
 
 ### Added

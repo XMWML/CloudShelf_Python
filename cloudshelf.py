@@ -217,8 +217,8 @@ RemoteClient = CoreRemoteClient
 class App(TkBase):
     def __init__(self):
         super().__init__(); self.title('CloudShelf'); self.geometry('1240x760'); self.minsize(980,620)
-        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.progress_stats={}; self.active_sync_rules=set(); self.clipboard=[]; self.clipboard_mode='copy'; self.checked_items=set(); self.connection_states={}; self.local_fingerprints={}; self.sync_scan_busy=False; self.load_profiles(); self.load_settings(); os.makedirs(PREVIEW_DIR,exist_ok=True); logging.basicConfig(filename=LOG_FILE,level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s'); self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=self.settings['max_workers'])
-        self.language=self.settings['language']; self.protocol('WM_DELETE_WINDOW',self.close_app); self.build_ui(); self.localize_widgets(); self.refresh_profiles(); self.after(5000,self.auto_sync)
+        self.profiles=[]; self.session=None; self.path='/'; self.history=['/']; self.history_index=0; self.items=[]; self.transfers=[]; self.jobs={}; self.retry_jobs={}; self.progress_stats={}; self.active_sync_rules=set(); self.clipboard=[]; self.clipboard_mode='copy'; self.checked_items=set(); self.connection_states={}; self.local_fingerprints={}; self.sync_scan_busy=False; self.activity_count=0; self.load_profiles(); self.load_settings(); os.makedirs(PREVIEW_DIR,exist_ok=True); logging.basicConfig(filename=LOG_FILE,level=logging.INFO,format='%(asctime)s %(levelname)s'); self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=self.settings['max_workers'])
+        self.language=self.settings['language']; self.protocol('WM_DELETE_WINDOW',self.close_app); self.build_ui(); self.localize_widgets(); self.refresh_profiles(); self.after(100,self.auto_connect); self.after(5000,self.auto_sync)
     def load_profiles(self):
         self.profiles=ProfileStore(PROFILE_FILE).load()
     def save_profiles(self):
@@ -263,13 +263,19 @@ class App(TkBase):
         ttk.Label(preview,text='Maximum preview size (KB)').grid(row=2,column=0,sticky='w',pady=4); ttk.Spinbox(preview,from_=1,to=102400,textvariable=maximum,width=10).grid(row=2,column=1,sticky='w',pady=4)
         ttk.Label(preview,text='Language').grid(row=3,column=0,sticky='w',pady=4); ttk.Combobox(preview,textvariable=language,values=('system','zh','en'),state='readonly',width=12).grid(row=3,column=1,sticky='w',pady=4)
         workers=tk.IntVar(value=self.max_workers); download_dir=tk.StringVar(value=self.settings['download_directory']); ask_destination=tk.BooleanVar(value=self.settings['ask_download_destination'])
+        automatic_connect=tk.StringVar(value=self.settings['automatic_connect_profile_id'])
         ttk.Label(transfer,text='Concurrent tasks').grid(row=0,column=0,sticky='w',pady=4); ttk.Spinbox(transfer,from_=1,to=8,textvariable=workers,width=8).grid(row=0,column=1,sticky='w',pady=4)
         ttk.Checkbutton(transfer,text='Ask for a destination on every download',variable=ask_destination).grid(row=1,column=0,columnspan=2,sticky='w',pady=4)
         ttk.Label(transfer,text='Default download directory').grid(row=2,column=0,sticky='w',pady=4); ttk.Entry(transfer,textvariable=download_dir,width=42).grid(row=2,column=1,sticky='ew',pady=4)
+        ttk.Label(transfer,text='Connect on launch').grid(row=3,column=0,sticky='w',pady=4)
+        choices={'Do not connect automatically': ''}
+        choices.update({f"{profile['name']} ({profile['protocol']})": str(profile['id']) for profile in self.profiles})
+        automatic_connect_label=tk.StringVar(value=next((name for name,profile_id in choices.items() if profile_id == automatic_connect.get()), 'Do not connect automatically'))
+        ttk.Combobox(transfer,textvariable=automatic_connect_label,values=list(choices),state='readonly',width=42).grid(row=3,column=1,sticky='ew',pady=4)
         ttk.Label(sync,text='Manage rules for the selected connection.').pack(anchor='w',pady=4); ttk.Button(sync,text='Open Sync Manager',command=self.sync_manager).pack(anchor='w')
         def save():
             try:
-                self.max_workers=max(1,min(8,workers.get())); self.settings.update({'preview_enabled':enabled.get(),'preview_extensions':extensions.get(),'preview_max_bytes':maximum.get()*1024,'language':language.get(),'download_directory':download_dir.get().strip(),'ask_download_destination':ask_destination.get()}); self.language=language.get()
+                self.max_workers=max(1,min(8,workers.get())); self.settings.update({'preview_enabled':enabled.get(),'preview_extensions':extensions.get(),'preview_max_bytes':maximum.get()*1024,'language':language.get(),'download_directory':download_dir.get().strip(),'ask_download_destination':ask_destination.get(),'automatic_connect_profile_id':choices[automatic_connect_label.get()]}); self.language=language.get()
             except tk.TclError: messagebox.showerror('Invalid settings','Task count and preview size must be numbers.',parent=w); return
             self.save_settings(); w.destroy()
         ttk.Button(w,text='Save',command=save).pack(anchor='e',padx=10,pady=(0,10))
@@ -280,7 +286,7 @@ class App(TkBase):
         pan=ttk.PanedWindow(self,orient='horizontal'); pan.pack(fill='both',expand=True,padx=6,pady=4)
         left=ttk.Frame(pan,width=270); right=ttk.Frame(pan); pan.add(left,weight=1); pan.add(right,weight=4)
         ttk.Label(left,text='连接').pack(anchor='w'); self.conn=ttk.Treeview(left,columns=('protocol','state'),show='tree headings',selectmode='browse'); self.conn.heading('#0',text='连接'); self.conn.heading('protocol',text='协议'); self.conn.heading('state',text='状态'); self.conn.column('protocol',width=70); self.conn.column('state',width=70); self.conn.pack(fill='both',expand=True); self.conn.bind('<<TreeviewSelect>>',self.select_profile); self.conn.bind('<Button-3>',self.connection_menu)
-        head=ttk.Frame(right); head.pack(fill='x'); self.status=tk.StringVar(value='未选择连接'); ttk.Label(head,textvariable=self.status).pack(side='left'); self.path_var=tk.StringVar(value='/'); ttk.Label(head,textvariable=self.path_var).pack(side='right')
+        head=ttk.Frame(right); head.pack(fill='x'); self.status=tk.StringVar(value='未选择连接'); ttk.Label(head,textvariable=self.status).pack(side='left'); self.activity=tk.StringVar(value=''); ttk.Label(head,textvariable=self.activity,foreground='#666666').pack(side='left',padx=8); self.activity_bar=ttk.Progressbar(head,mode='indeterminate',length=72); self.path_var=tk.StringVar(value='/'); ttk.Label(head,textvariable=self.path_var).pack(side='right')
         self.files=ttk.Treeview(right,columns=('checked','size','type','modified'),show='tree headings',selectmode='extended'); self.files.heading('#0',text='名称'); self.files.heading('checked',text='选择'); self.files.heading('size',text='大小'); self.files.heading('type',text='类型'); self.files.heading('modified',text='修改时间'); self.files.column('#0',width=390); self.files.column('checked',width=52,anchor='center'); self.files.column('size',width=100); self.files.column('type',width=100); self.files.pack(fill='both',expand=True); self.files.bind('<Double-1>',self.open_item); self.files.bind('<Button-3>',self.context_menu); self.files.bind('<Button-1>',self.file_click); self.files.bind('<<TreeviewSelect>>',self.preview_selected)
         if DND_FILES:
             self.files.drop_target_register(DND_FILES); self.files.dnd_bind('<<Drop>>',self.drop_upload)
@@ -288,6 +294,19 @@ class App(TkBase):
         transfer_head=ttk.Frame(self); transfer_head.pack(fill='x',padx=8); ttk.Label(transfer_head,text='传输任务').pack(side='left'); ttk.Button(transfer_head,text='清除已结束',command=self.clear_finished_transfers).pack(side='right',padx=3); ttk.Button(transfer_head,text='全部开始',command=self.start_all_transfers).pack(side='right',padx=3); ttk.Button(transfer_head,text='全部停止',command=self.pause_all_transfers).pack(side='right',padx=3); ttk.Button(transfer_head,text='重试失败',command=self.retry_failed_transfers).pack(side='right',padx=3); ttk.Button(transfer_head,text='暂停/继续',command=self.pause_task).pack(side='right',padx=3); ttk.Button(transfer_head,text='取消任务',command=self.cancel_task).pack(side='right'); self.transfer=ttk.Treeview(self,columns=('state','progress'),show='tree headings',height=6); self.transfer.heading('#0',text='项目'); self.transfer.heading('state',text='状态'); self.transfer.heading('progress',text='进度'); self.transfer.pack(fill='x',padx=6,pady=(0,6))
     def refresh_profiles(self):
         self.conn.delete(*self.conn.get_children()); [self.conn.insert('', 'end', iid=str(p['id']), text=p['name'], values=(p['protocol'],self.connection_states.get(str(p['id']),'未连接'))) for p in self.profiles]
+    def auto_connect(self):
+        identifier=self.settings.get('automatic_connect_profile_id','')
+        if identifier and any(str(profile['id']) == identifier for profile in self.profiles):
+            self.conn.selection_set(identifier); self.select_profile()
+    def set_activity(self, text=None):
+        if text:
+            self.activity_count += 1; self.activity.set(text)
+            if not self.activity_bar.winfo_manager(): self.activity_bar.pack(side='left')
+            self.activity_bar.start(10)
+        else:
+            self.activity_count=max(0,self.activity_count-1)
+            if not self.activity_count:
+                self.activity.set(''); self.activity_bar.stop(); self.activity_bar.pack_forget()
     def select_profile(self,_=None):
         sel=self.conn.selection();
         if not sel:return
@@ -306,17 +325,18 @@ class App(TkBase):
         iid=self.conn.identify_row(event.y)
         if iid:self.conn.selection_set(iid)
         menu=tk.Menu(self,tearoff=0); menu.add_command(label='连接/断开',command=self.toggle_connection); menu.add_command(label='编辑',command=self.edit_profile); menu.add_command(label='删除',command=self.delete_profile); menu.post(event.x_root,event.y_root)
-    def worker(self, fn, ok=None, iid=None):
+    def worker(self, fn, ok=None, iid=None, activity=None):
+        if activity: self.set_activity(activity)
         def run():
-            try: result=fn(); self.after(0,lambda: ok(result) if ok else None)
-            except TaskCancelled: self.after(0,lambda:self.update_transfer(iid,'已取消','-') if iid else None)
-            except Exception as e: logging.exception('Background task failed'); self.after(0,lambda:(self.update_transfer(iid,'失败','-') if iid else None, messagebox.showerror('操作失败',str(e))))
+            try: result=fn(); self.after(0,lambda:(ok(result) if ok else None, self.set_activity() if activity else None))
+            except TaskCancelled: self.after(0,lambda:(self.update_transfer(iid,'已取消','-') if iid else None, self.set_activity() if activity else None))
+            except Exception as e: logging.exception('Background task failed'); self.after(0,lambda:(self.update_transfer(iid,'失败','-') if iid else None, messagebox.showerror('操作失败',str(e)), self.set_activity() if activity else None))
         self.executor.submit(run)
     def close_app(self):
         self.executor.shutdown(wait=False,cancel_futures=True); self.destroy()
     def refresh(self):
         if not self.session:return
-        self.worker(lambda:self.session.list(self.path),self.show_items)
+        self.worker(lambda:self.session.list(self.path),self.show_items,activity='正在加载文件夹…')
     def show_items(self,items):
         self.items=items; self.checked_items.clear(); self.files.delete(*self.files.get_children());
         if self.path!='/': self.files.insert('',0,iid='__up__',text='..',values=('', '-', '上级目录','-'))
@@ -461,7 +481,8 @@ class App(TkBase):
     def cancel_task(self):
         for iid in self.transfer.selection():
             task=self.jobs.get(iid)
-            if task: task.cancelled=True; task._resume.set(); self.update_transfer(iid,'取消中','-')
+            if task and task.paused:
+                task.cancelled=True; task._resume.set(); self.update_transfer(iid,'取消中','-')
     def pause_task(self):
         for iid in self.transfer.selection():
             task=self.jobs.get(iid)
@@ -499,7 +520,7 @@ class App(TkBase):
             self.set_preview('文件超过预览大小限制。'); return
         target=os.path.join(PREVIEW_DIR,str(uuid.uuid4())+'-'+os.path.basename(item['name']))
         self.set_preview('正在下载预览…')
-        self.worker(lambda:self.session.download(item,target),lambda _:self.show_preview_file(target))
+        self.worker(lambda:self.session.download(item,target),lambda _:self.show_preview_file(target),activity='正在下载预览…')
     def show_preview_file(self,path):
         try:
             with open(path,'rb') as handle: data=handle.read(self.settings['preview_max_bytes']+1)
@@ -520,7 +541,9 @@ class App(TkBase):
         if not sel:return
         p=next(p for p in self.profiles if str(p['id'])==sel[0])
         if messagebox.askyesno('删除连接',f'确定删除连接“{p["name"]}”？',parent=self):
-            CredentialStore.delete(p['id']); self.profiles.remove(p); self.session=None; self.save_profiles(); self.refresh_profiles(); self.files.delete(*self.files.get_children()); self.status.set('未选择连接')
+            CredentialStore.delete(p['id']); self.profiles.remove(p); self.session=None
+            if self.settings.get('automatic_connect_profile_id') == str(p['id']): self.settings['automatic_connect_profile_id']=''; self.save_settings()
+            self.save_profiles(); self.refresh_profiles(); self.files.delete(*self.files.get_children()); self.status.set('未选择连接')
     def edit_profile(self):
         sel=self.conn.selection();
         if sel:self.profile_dialog(next(p for p in self.profiles if str(p['id'])==sel[0]))
